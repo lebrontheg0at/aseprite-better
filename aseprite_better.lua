@@ -43,6 +43,13 @@ local function ui_labels()
       scope_cel = "当前帧",
       scope_frames = "当前图层所有帧",
       shadow_layer_name = "阴影",
+      -- flatten colors command
+      flatten_title = "扁平化",
+      flatten_about = "把相近的颜色归并成同一个颜色，并清除半透明像素。",
+      ft_tolerance = "相似色合并阈值",
+      ft_clear = "清除半透明像素（0<不透明度<100%）",
+      ft_indexed = "索引色模式暂不支持，请先转为 RGB 模式（精灵 → 色彩模式 → RGB）。",
+      ft_summary = "扁平化完成：颜色 %d → %d，清除半透明像素 %d 个。",
     }
   end
   return {
@@ -68,6 +75,12 @@ local function ui_labels()
     scope_cel = "Current frame",
     scope_frames = "All frames of current layer",
     shadow_layer_name = "Shadow",
+    flatten_title = "Flatten Colors",
+    flatten_about = "Merge similar colors into one and clear semi-transparent pixels.",
+    ft_tolerance = "Color merge tolerance",
+    ft_clear = "Clear semi-transparent pixels (0 < alpha < 100%)",
+    ft_indexed = "Indexed color mode is not supported. Convert to RGB first (Sprite → Color Mode → RGB).",
+    ft_summary = "Flattened: %d colors → %d, cleared %d semi-transparent pixel(s).",
   }
 end
 
@@ -292,6 +305,126 @@ function apply_drop_shadow(opts)
 end
 
 -- ---------------------------------------------------------------------------
+-- 3. Flatten colors
+-- ---------------------------------------------------------------------------
+
+-- Turns semi-transparent pixels fully transparent and merges similar colors
+-- into a single color, so the artwork ends up with few flat colors and no
+-- visible gradients.
+--
+-- The color histogram is collected across every processed frame first and
+-- clustered once, so the same input color always maps to the same output color
+-- in all frames (important for animation).
+--
+-- opts fields:
+--   layer        Layer (defaults to the active layer)
+--   tolerance    number, max RGB distance for two colors to be merged (0..255)
+--   clear_semi   boolean, clear pixels with 0 < alpha < 255 (default true)
+--   all_frames   boolean
+-- Returns a table { before = n, after = n, cleared = n }.
+function flatten_colors(opts)
+  local spr = app.activeSprite
+  if not spr then return nil end
+  local layer = opts.layer or app.activeLayer
+  if not layer then return nil end
+  if spr.colorMode == ColorMode.INDEXED then return nil end
+
+  local tol = math.max(0, math.min(255, math.floor(opts.tolerance or 24)))
+  local tol2 = tol * tol
+  local clear_semi = opts.clear_semi
+  if clear_semi == nil then clear_semi = true end
+
+  local frames = frames_to_process(spr, { all_frames = opts.all_frames })
+  local counts, keys = {}, {}
+  local centers, map = {}, {}
+  local cleared = 0
+
+  local function color_key(r, g, b)
+    return r * 65536 + g * 256 + b
+  end
+
+  app.transaction(function()
+    -- pass 1: clear semi-transparent pixels, collect the color histogram
+    for _, frame in ipairs(frames) do
+      local cel = layer:cel(frame)
+      if cel then
+        local img = cel.image
+        for y = 0, img.height - 1 do
+          for x = 0, img.width - 1 do
+            local v = img:getPixel(x, y)
+            local a = pc.rgbaA(v)
+            if a > 0 then
+              if a < 255 then
+                if clear_semi then
+                  img:putPixel(x, y, pc.rgba(0, 0, 0, 0))
+                  cleared = cleared + 1
+                end
+              else
+                local key = color_key(pc.rgbaR(v), pc.rgbaG(v), pc.rgbaB(v))
+                if counts[key] then
+                  counts[key] = counts[key] + 1
+                else
+                  counts[key] = 1
+                  keys[#keys + 1] = key
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+
+    -- cluster: walk colors from most to least frequent, keep a color as a new
+    -- cluster center only when it is not already close to an existing one
+    table.sort(keys, function(a, b) return counts[a] > counts[b] end)
+    for _, key in ipairs(keys) do
+      local r = math.floor(key / 65536) % 256
+      local g = math.floor(key / 256) % 256
+      local b = key % 256
+      local best, best_d = nil, math.huge
+      for _, c in ipairs(centers) do
+        local dr, dg, db = r - c[1], g - c[2], b - c[3]
+        local d = dr * dr + dg * dg + db * db
+        if d < best_d then
+          best_d = d
+          best = c
+        end
+      end
+      if best and best_d <= tol2 then
+        map[key] = best
+      else
+        local c = { r, g, b }
+        centers[#centers + 1] = c
+        map[key] = c
+      end
+    end
+
+    -- pass 2: remap every opaque pixel to its cluster center
+    for _, frame in ipairs(frames) do
+      local cel = layer:cel(frame)
+      if cel then
+        local img = cel.image
+        for y = 0, img.height - 1 do
+          for x = 0, img.width - 1 do
+            local v = img:getPixel(x, y)
+            if pc.rgbaA(v) == 255 then
+              local r, g, b = pc.rgbaR(v), pc.rgbaG(v), pc.rgbaB(v)
+              local c = map[color_key(r, g, b)]
+              if c and (c[1] ~= r or c[2] ~= g or c[3] ~= b) then
+                img:putPixel(x, y, pc.rgba(c[1], c[2], c[3], 255))
+              end
+            end
+          end
+        end
+      end
+    end
+  end)
+
+  app.refresh()
+  return { before = #keys, after = #centers, cleared = cleared }
+end
+
+-- ---------------------------------------------------------------------------
 -- Registration
 -- ---------------------------------------------------------------------------
 
@@ -379,6 +512,58 @@ function init(plugin)
         output = (data.output == labels.out_merge) and "merge" or "layer",
         all_frames = (data.scope == labels.scope_frames),
       }
+    end,
+  }
+
+  plugin:newCommand{
+    id = "FlattenColors",
+    title = labels.flatten_title,
+    group = "edit_fx",
+    onclick = function()
+      local spr = app.activeSprite
+      if not spr then
+        app.alert(labels.no_sprite)
+        return
+      end
+      if not app.activeLayer then
+        app.alert(labels.no_layer)
+        return
+      end
+      if spr.colorMode == ColorMode.INDEXED then
+        app.alert(labels.ft_indexed)
+        return
+      end
+
+      local dlg = Dialog{ title = labels.flatten_title }
+      if not dlg then return end
+
+      dlg:label{ label = labels.flatten_about }
+      dlg:separator{}
+      dlg:number{ id = "tolerance", label = labels.ft_tolerance, text = "24", decimals = 0 }
+      dlg:check{ id = "clear_semi", text = labels.ft_clear, selected = true }
+      dlg:separator{}
+      dlg:combobox{
+        id = "scope", label = labels.scope,
+        option = labels.scope_cel,
+        options = { labels.scope_cel, labels.scope_frames },
+      }
+      dlg:separator{}
+      dlg:button{ id = "ok", text = "OK", focus = true }
+      dlg:button{ id = "cancel", text = "Cancel" }
+      dlg:show()
+
+      local data = dlg.data
+      if not data.ok then return end
+
+      local res = flatten_colors{
+        layer = app.activeLayer,
+        tolerance = data.tolerance,
+        clear_semi = data.clear_semi,
+        all_frames = (data.scope == labels.scope_frames),
+      }
+      if res then
+        app.alert(string.format(labels.ft_summary, res.before, res.after, res.cleared))
+      end
     end,
   }
 end

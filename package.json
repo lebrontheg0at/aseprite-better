@@ -1,15 +1,21 @@
 {
   "name": "aseprite-better",
   "displayName": "Aseprite Better",
-  "description": "Quality-of-life commands for Aseprite: toggle the bottom layer's visibility, and generate drop shadows",
-  "version": "1.0",
-  "author": { "name": "Saber" },
+  "description": "Quality-of-life commands for Aseprite: toggle the bottom layer’s visibility, drop shadows, and color flattening",
+  "version": "1.1",
+  "author": {
+    "name": "Saber"
+  },
   "publisher": "saber",
   "license": "CC0",
-  "categories": [ "Scripts" ],
+  "categories": [
+    "Scripts"
+  ],
   "contributes": {
     "scripts": [
-      { "path": "./aseprite_better.lua" }
+      {
+        "path": "./aseprite_better.lua"
+      }
     ]
   }
 }
