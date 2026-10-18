@@ -68,7 +68,8 @@ noisy "fake pixel art" edges back into crisp pixel blocks.
 | Output | **New sprite** at the true pixel size, or **new layer** that keeps the canvas size |
 
 Algorithm reference: [Perfect Pixel](https://github.com/theamusing/perfectPixel)
-by theAmusing (MIT) — grid size estimated from gradient profiles, each grid line
+by theAmusing (MIT) — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the
+full attribution and license text. — grid size estimated from gradient profiles, each grid line
 then snapped to the strongest nearby edge, then one sample per cell. This is an
 independent Lua implementation for Aseprite, with three deliberate differences:
 

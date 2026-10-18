@@ -475,12 +475,13 @@ end
 -- 4. Perfect Pixel (grid restore)
 -- ---------------------------------------------------------------------------
 --
--- Algorithm reference: "Perfect Pixel" by theAmusing (MIT),
+-- Implements the algorithm of "Perfect Pixel" by theAmusing (MIT License),
 -- https://github.com/theamusing/perfectPixel — grid size estimation from
--- gradient profiles, per-grid-line refinement, then one sample per cell.
--- This is an independent Lua implementation for Aseprite; it uses the
--- gradient path (the upstream FFT estimator is not ported) and samples RGBA
--- so transparent cells stay transparent.
+-- gradient profiles, per-grid-line snapping, then one sample per cell.
+-- This Lua code is an independent implementation for the Aseprite API, not a
+-- copy of the upstream Python source. See THIRD-PARTY-NOTICES.md for the full
+-- attribution and license text, and README.md for the deliberate deviations
+-- (gradient estimator only, percentile threshold, alpha-aware sampling).
 
 local function to_gray(img)
   local w, h = img.width, img.height
