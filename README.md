@@ -52,6 +52,38 @@ semi-transparent pixel(s)`.
 Not supported in Indexed color mode (convert with `Sprite → Color Mode → RGB`
 first).
 
+### 4. Perfect Pixel (Grid Restore)
+
+`Edit → FX → Perfect Pixel` (`编辑 → FX → 完美像素`).
+
+For artwork that came out of an upscaler or an image generator: it detects the
+underlying pixel grid and resamples exactly one colour per cell, turning soft or
+noisy "fake pixel art" edges back into crisp pixel blocks.
+
+| Option | Meaning |
+|---|---|
+| Sampling | **Majority cluster** (two-means per cell — most robust), **Center sample**, or **Median** |
+| Grid size | **Auto detect**, or type the column/row count yourself |
+| Merge similar colors | Tolerance for merging near-duplicate colours *after* sampling; `0` disables it |
+| Output | **New sprite** at the true pixel size, or **new layer** that keeps the canvas size |
+
+Algorithm reference: [Perfect Pixel](https://github.com/theamusing/perfectPixel)
+by theAmusing (MIT) — grid size estimated from gradient profiles, each grid line
+then snapped to the strongest nearby edge, then one sample per cell. This is an
+independent Lua implementation for Aseprite, with three deliberate differences:
+
+- Only the gradient estimator is ported; the upstream FFT estimator is not.
+- The peak threshold uses a high percentile of the profile instead of its maximum,
+  so a transparent margin (whose hard "empty → artwork" edge can dwarf every real
+  grid line) does not hide the grid. Upstream would fail on such sprites.
+- Sampling is alpha-aware and skips fully transparent pixels, so sprites with
+  transparent backgrounds restore cleanly instead of picking up muddy edges.
+  A cell with no opaque pixel is written out as fully transparent.
+
+Each cell is sampled independently, so cells sharing one true colour still differ
+by a few units — that is why the merge step exists (upstream expects a separate
+quantisation pass; here `Flatten Colors` can do it too).
+
 ## Install
 
 Copy `package.json` and `aseprite_better.lua` into:

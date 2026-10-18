@@ -50,6 +50,30 @@ local function ui_labels()
       ft_clear = "清除半透明像素（0<不透明度<100%）",
       ft_indexed = "索引色模式暂不支持，请先转为 RGB 模式（精灵 → 色彩模式 → RGB）。",
       ft_summary = "扁平化完成：颜色 %d → %d，清除半透明像素 %d 个。",
+      -- perfect pixel command
+      pp_title = "完美像素（网格还原）",
+      pp_about = "检测像素画的网格并逐格重新采样，把杂乱的边缘还原成干净的像素块。",
+      pp_sampling = "采样方式",
+      pp_s_majority = "多数聚类",
+      pp_s_center = "中心采样",
+      pp_s_median = "中位数",
+      pp_grid = "网格大小",
+      pp_g_auto = "自动检测",
+      pp_g_manual = "手动指定",
+      pp_grid_w = "横向格数",
+      pp_grid_h = "纵向格数",
+      pp_output = "输出到",
+      pp_o_layer = "新建图层（放大回原尺寸）",
+      pp_o_sprite = "新建精灵（真实像素尺寸）",
+      pp_scope = "处理范围",
+      pp_scope_layer = "当前图层",
+      pp_layer_name = "完美像素",
+      pp_fail = "网格检测失败：画面里找不到足够明显的像素边界。请改用「手动指定」格数。",
+      pp_bad_size = "检测到的像素格 %.2f × %.2f px 超出合理范围（4～20 px），结果可能不对；可用手动指定。",
+      pp_result_layer = "检测到像素格 %.2f × %.2f px，已在原尺寸上还原为 %d × %d 格。",
+      pp_result_sprite = "检测到像素格 %.2f × %.2f px，已新建精灵 %d × %d。",
+      pp_merge = "合并相近颜色（0 = 关闭）",
+      pp_colors = "颜色 %d → %d。",
     }
   end
   return {
@@ -81,6 +105,29 @@ local function ui_labels()
     ft_clear = "Clear semi-transparent pixels (0 < alpha < 100%)",
     ft_indexed = "Indexed color mode is not supported. Convert to RGB first (Sprite → Color Mode → RGB).",
     ft_summary = "Flattened: %d colors → %d, cleared %d semi-transparent pixel(s).",
+    pp_title = "Perfect Pixel (Grid Restore)",
+    pp_about = "Detect the pixel grid and resample each cell, turning messy edges into clean pixel blocks.",
+    pp_sampling = "Sampling",
+    pp_s_majority = "Majority cluster",
+    pp_s_center = "Center sample",
+    pp_s_median = "Median",
+    pp_grid = "Grid size",
+    pp_g_auto = "Auto detect",
+    pp_g_manual = "Manual",
+    pp_grid_w = "Grid columns",
+    pp_grid_h = "Grid rows",
+    pp_output = "Output",
+    pp_o_layer = "New layer (scaled back to canvas size)",
+    pp_o_sprite = "New sprite (true pixel size)",
+    pp_scope = "Source",
+    pp_scope_layer = "Active layer",
+    pp_layer_name = "Perfect Pixel",
+    pp_fail = "Grid detection failed: no clear pixel boundaries were found. Use the manual grid size instead.",
+    pp_bad_size = "Detected pixel size %.2f × %.2f px is outside the plausible range (4-20 px); the result may be wrong - consider the manual grid size.",
+    pp_result_layer = "Detected %.2f × %.2f px per cell; restored to %d × %d cells at canvas size.",
+    pp_result_sprite = "Detected %.2f × %.2f px per cell; created a new %d × %d sprite.",
+    pp_merge = "Merge similar colors (0 = off)",
+    pp_colors = "Colors %d → %d.",
   }
 end
 
@@ -425,6 +472,426 @@ function flatten_colors(opts)
 end
 
 -- ---------------------------------------------------------------------------
+-- 4. Perfect Pixel (grid restore)
+-- ---------------------------------------------------------------------------
+--
+-- Algorithm reference: "Perfect Pixel" by theAmusing (MIT),
+-- https://github.com/theamusing/perfectPixel — grid size estimation from
+-- gradient profiles, per-grid-line refinement, then one sample per cell.
+-- This is an independent Lua implementation for Aseprite; it uses the
+-- gradient path (the upstream FFT estimator is not ported) and samples RGBA
+-- so transparent cells stay transparent.
+
+local function to_gray(img)
+  local w, h = img.width, img.height
+  local gray = {}
+  for y = 0, h - 1 do
+    for x = 0, w - 1 do
+      local v = img:getPixel(x, y)
+      gray[y * w + x + 1] = 0.299 * pc.rgbaR(v) + 0.587 * pc.rgbaG(v) + 0.114 * pc.rgbaB(v)
+    end
+  end
+  return gray
+end
+
+-- Sobel gradients with edge clamping; returns per-column |gx| sums and
+-- per-row |gy| sums, which spike on the pixel-art grid lines.
+local function gradient_profiles(gray, w, h)
+  local col = {}
+  local row = {}
+  for i = 1, w do col[i] = 0 end
+  for i = 1, h do row[i] = 0 end
+
+  local function g(x, y)
+    if x < 0 then x = 0 elseif x >= w then x = w - 1 end
+    if y < 0 then y = 0 elseif y >= h then y = h - 1 end
+    return gray[y * w + x + 1]
+  end
+
+  for y = 0, h - 1 do
+    for x = 0, w - 1 do
+      local tl, tc, tr = g(x - 1, y - 1), g(x, y - 1), g(x + 1, y - 1)
+      local ml, mr = g(x - 1, y), g(x + 1, y)
+      local bl, bc, br = g(x - 1, y + 1), g(x, y + 1), g(x + 1, y + 1)
+      local sx = (tr + 2 * mr + br) - (tl + 2 * ml + bl)
+      local sy = (bl + 2 * bc + br) - (tl + 2 * tc + tr)
+      col[x + 1] = col[x + 1] + math.abs(sx)
+      row[y + 1] = row[y + 1] + math.abs(sy)
+    end
+  end
+  return col, row
+end
+
+local function median(t)
+  if #t == 0 then return nil end
+  local c = {}
+  for i = 1, #t do c[i] = t[i] end
+  table.sort(c)
+  local n = #c
+  if n % 2 == 1 then return c[(n + 1) / 2] end
+  return (c[n / 2] + c[n / 2 + 1]) / 2
+end
+
+-- Robust reference level for the peak threshold. Upstream uses the profile
+-- maximum; on a sprite with transparent margins that single hard edge
+-- (empty -> artwork) can be an order of magnitude above every real grid line
+-- and would hide all of them, so we use a high percentile instead.
+local function profile_reference(profile, n)
+  local c = {}
+  for i = 1, n do c[i] = profile[i] end
+  table.sort(c)
+  local idx = math.max(1, math.floor(n * 0.9))
+  return c[idx]
+end
+
+-- Grid size from the spacing between strong gradient peaks.
+local function estimate_grid(n, profile, rel_thr, min_interval)
+  local ref = profile_reference(profile, n)
+  if ref <= 1e-6 then return nil end
+  local thr = rel_thr * ref
+  local peaks = {}
+  for i = 2, n - 1 do
+    if profile[i] > profile[i - 1] and profile[i] > profile[i + 1] and profile[i] >= thr then
+      if #peaks == 0 or (i - peaks[#peaks]) >= min_interval then
+        peaks[#peaks + 1] = i
+      end
+    end
+  end
+  if #peaks < 4 then return nil end
+  local gaps = {}
+  for i = 2, #peaks do gaps[#gaps + 1] = peaks[i] - peaks[i - 1] end
+  local m = median(gaps)
+  if not m or m <= 0 then return nil end
+  return n / m
+end
+
+-- Snap one grid line: strongest local maximum within [origin-range, origin+range],
+-- otherwise the rounded origin (upstream find_best_grid).
+local function snap_line(origin, range, profile, n)
+  local best = math.floor(origin + 0.5)
+  local best_v = -1
+  for i = -math.floor(range + 0.5), math.floor(range + 0.5) do
+    local c = math.floor(origin + i + 0.5)
+    if c >= 1 and c <= n - 2 then
+      local v = profile[c + 1]
+      if v > profile[c] and v > profile[c + 2] and v > best_v then
+        best_v = v
+        best = c
+      end
+    end
+  end
+  return best
+end
+
+-- Walk outward from the centre, snapping each successive grid line.
+local function refine_lines(size, profile, n, cell, intensity)
+  local coords = {}
+  local x = snap_line(size / 2, cell, profile, n)
+  while x < n + cell / 2 do
+    x = snap_line(x, cell * intensity, profile, n)
+    coords[#coords + 1] = x
+    x = x + cell
+  end
+  x = snap_line(size / 2, cell, profile, n) - cell
+  while x > -cell / 2 do
+    x = snap_line(x, cell * intensity, profile, n)
+    coords[#coords + 1] = x
+    x = x - cell
+  end
+  table.sort(coords)
+  return coords
+end
+
+-- Collect a cell's pixels (strided so huge cells stay cheap). Fully
+-- transparent pixels are skipped: on a sprite they are "no artwork here", and
+-- letting them take part would drag edge cells towards a muddy see-through
+-- average instead of the artwork's own colour. A cell with no opaque pixel at
+-- all comes back empty and is written out as fully transparent.
+local function collect_cell(img, x0, y0, x1, y1, cap)
+  local rs, gs, bs, as = {}, {}, {}, {}
+  local n = 0
+  local cw = math.max(1, x1 - x0)
+  local ch = math.max(1, y1 - y0)
+  local stride = 1
+  if cw * ch > cap then
+    stride = math.max(1, math.ceil(math.sqrt((cw * ch) / cap)))
+  end
+  local y = y0
+  while y < y1 and n < cap do
+    local x = x0
+    while x < x1 and n < cap do
+      local v = img:getPixel(x, y)
+      local a = pc.rgbaA(v)
+      if a > 0 then
+        n = n + 1
+        rs[n], gs[n], bs[n], as[n] = pc.rgbaR(v), pc.rgbaG(v), pc.rgbaB(v), a
+      end
+      x = x + stride
+    end
+    y = y + stride
+  end
+  return rs, gs, bs, as, n
+end
+
+local function mean_of(rs, gs, bs, as, n)
+  local sr, sg, sb, sa = 0, 0, 0, 0
+  for i = 1, n do
+    sr, sg, sb, sa = sr + rs[i], sg + gs[i], sb + bs[i], sa + as[i]
+  end
+  return sr / n, sg / n, sb / n, sa / n
+end
+
+-- Two-means split of the cell; the bigger cluster wins (upstream majority).
+local function sample_majority(rs, gs, bs, as, n)
+  if n == 0 then return 0, 0, 0, 0 end
+  local c0r, c0g, c0b, c0a = rs[1], gs[1], bs[1], as[1]
+  local bi, bd = 1, -1
+  for i = 1, n do
+    local dr, dg, db, da = rs[i] - c0r, gs[i] - c0g, bs[i] - c0b, as[i] - c0a
+    local d = dr * dr + dg * dg + db * db + da * da
+    if d > bd then
+      bd = d
+      bi = i
+    end
+  end
+  local c1r, c1g, c1b, c1a = rs[bi], gs[bi], bs[bi], as[bi]
+  local n0, n1 = 0, 0
+  for _ = 1, 6 do
+    local i0, i1 = {}, {}
+    n0, n1 = 0, 0
+    for i = 1, n do
+      local dr0, dg0, db0, da0 = rs[i] - c0r, gs[i] - c0g, bs[i] - c0b, as[i] - c0a
+      local dr1, dg1, db1, da1 = rs[i] - c1r, gs[i] - c1g, bs[i] - c1b, as[i] - c1a
+      local d0 = dr0 * dr0 + dg0 * dg0 + db0 * db0 + da0 * da0
+      local d1 = dr1 * dr1 + dg1 * dg1 + db1 * db1 + da1 * da1
+      if d1 < d0 then
+        n1 = n1 + 1
+        i1[n1] = i
+      else
+        n0 = n0 + 1
+        i0[n0] = i
+      end
+    end
+    if n0 > 0 then
+      local sr, sg, sb, sa = 0, 0, 0, 0
+      for _, i in ipairs(i0) do sr, sg, sb, sa = sr + rs[i], sg + gs[i], sb + bs[i], sa + as[i] end
+      c0r, c0g, c0b, c0a = sr / n0, sg / n0, sb / n0, sa / n0
+    end
+    if n1 > 0 then
+      local sr, sg, sb, sa = 0, 0, 0, 0
+      for _, i in ipairs(i1) do sr, sg, sb, sa = sr + rs[i], sg + gs[i], sb + bs[i], sa + as[i] end
+      c1r, c1g, c1b, c1a = sr / n1, sg / n1, sb / n1, sa / n1
+    end
+  end
+  if n1 >= n0 then return c1r, c1g, c1b, c1a end
+  return c0r, c0g, c0b, c0a
+end
+
+local function sample_cell(img, x0, y0, x1, y1, method, cap)
+  local rs, gs, bs, as, n = collect_cell(img, x0, y0, x1, y1, cap)
+  if n == 0 then return 0, 0, 0, 0 end
+  if method == "center" then
+    local cx = math.floor((x0 + x1 - 1) / 2)
+    local cy = math.floor((y0 + y1 - 1) / 2)
+    local v = img:getPixel(cx, cy)
+    return pc.rgbaR(v), pc.rgbaG(v), pc.rgbaB(v), pc.rgbaA(v)
+  elseif method == "median" then
+    local tr, tg, tb, ta = {}, {}, {}, {}
+    for i = 1, n do tr[i], tg[i], tb[i], ta[i] = rs[i], gs[i], bs[i], as[i] end
+    return median(tr) or 0, median(tg) or 0, median(tb) or 0, median(ta) or 0
+  end
+  return sample_majority(rs, gs, bs, as, n)
+end
+
+local function rnd(v)
+  v = math.floor(v + 0.5)
+  if v < 0 then return 0 elseif v > 255 then return 255 end
+  return v
+end
+
+-- Each cell is sampled on its own, so cells that share one true colour still
+-- come out a few units apart (the upstream tool has the same property and
+-- expects a quantisation pass afterwards). Merge those near-duplicates so the
+-- restored grid really is flat. Returns colours before / after.
+local function merge_grid_colors(cells, tol)
+  local counts, order = {}, {}
+  local function key_of(c)
+    return c[1] * 16777216 + c[2] * 65536 + c[3] * 256 + c[4]
+  end
+  for j = 1, #cells do
+    for i = 1, #cells[j] do
+      local k = key_of(cells[j][i])
+      if counts[k] then
+        counts[k] = counts[k] + 1
+      else
+        counts[k] = 1
+        order[#order + 1] = k
+      end
+    end
+  end
+  table.sort(order, function(a, b) return counts[a] > counts[b] end)
+
+  local tol2 = tol * tol
+  local centers, map = {}, {}
+  for _, k in ipairs(order) do
+    local r = math.floor(k / 16777216) % 256
+    local g = math.floor(k / 65536) % 256
+    local b = math.floor(k / 256) % 256
+    local a = k % 256
+    local best, best_d = nil, math.huge
+    for _, c in ipairs(centers) do
+      local dr, dg, db, da = r - c[1], g - c[2], b - c[3], a - c[4]
+      local d = dr * dr + dg * dg + db * db + da * da
+      if d < best_d then
+        best_d = d
+        best = c
+      end
+    end
+    if best and best_d <= tol2 then
+      map[k] = best
+    else
+      local c = { r, g, b, a }
+      centers[#centers + 1] = c
+      map[k] = c
+    end
+  end
+
+  for j = 1, #cells do
+    for i = 1, #cells[j] do
+      local m = map[key_of(cells[j][i])]
+      cells[j][i] = { m[1], m[2], m[3], m[4] }
+    end
+  end
+  return #order, #centers
+end
+
+-- opts fields:
+--   method      "majority" | "center" | "median"
+--   grid_w      number  (0/nil = auto detect)
+--   grid_h      number
+--   output      "layer" | "sprite"
+--   frame       number (for "layer" output)
+-- Returns a table, or nil plus a message key on failure.
+function perfect_pixel_restore(opts)
+  local spr = app.activeSprite
+  if not spr then return nil, "no_sprite" end
+  local layer = app.activeLayer
+  if not layer then return nil, "no_layer" end
+  local frame = opts.frame or app.frame
+
+  local w, h = spr.width, spr.height
+  local src = nil
+  do
+    -- the active cel's own image bounds, so unrelated empty margins are ignored
+    local cel = layer:cel(frame)
+    if not cel then return nil, "no_cel" end
+    src = { img = cel.image, x = cel.position.x, y = cel.position.y }
+    w, h = cel.image.width, cel.image.height
+  end
+
+  local gray = to_gray(src.img)
+  local col_sum, row_sum = gradient_profiles(gray, w, h)
+
+  local gw, gh = opts.grid_w or 0, opts.grid_h or 0
+  local auto = (gw <= 0 or gh <= 0)
+  if auto then
+    local e_col = estimate_grid(w, col_sum, 0.2, 4)
+    local e_row = estimate_grid(h, row_sum, 0.2, 4)
+    if not e_col or not e_row then return nil, "pp_fail" end
+    gw = math.max(1, math.floor(e_col + 0.5))
+    gh = math.max(1, math.floor(e_row + 0.5))
+    -- implausible cell sizes mean the detection latched onto noise; a grid
+    -- coarser than the artwork would also blow up the sampling loop below
+    local cw, ch = w / gw, h / gh
+    if cw < 2 or cw > 64 or ch < 2 or ch > 64 then return nil, "pp_fail" end
+  else
+    gw = math.max(1, math.min(w, gw))
+    gh = math.max(1, math.min(h, gh))
+  end
+
+  local cell_w = w / gw
+  local cell_h = h / gh
+  local xs = refine_lines(w, col_sum, w, cell_w, 0.25)
+  local ys = refine_lines(h, row_sum, h, cell_h, 0.25)
+  if #xs < 2 or #ys < 2 then return nil, "pp_fail" end
+
+  local nw, nh = #xs - 1, #ys - 1
+  local method = opts.method or "majority"
+
+  -- one sample per cell
+  local cells = {}
+  for j = 1, nh do
+    local y0 = math.max(0, math.ceil(ys[j]))
+    local y1 = math.min(h, math.ceil(ys[j + 1]))
+    if y1 <= y0 then y1 = math.min(h, y0 + 1) end
+    local row = {}
+    for i = 1, nw do
+      local x0 = math.max(0, math.ceil(xs[i]))
+      local x1 = math.min(w, math.ceil(xs[i + 1]))
+      if x1 <= x0 then x1 = math.min(w, x0 + 1) end
+      local r, g, b, a = sample_cell(src.img, x0, y0, x1, y1, method, 128)
+      row[i] = { rnd(r), rnd(g), rnd(b), rnd(a) }
+    end
+    cells[j] = row
+  end
+
+  local before, after = nil, nil
+  if (opts.merge_tol or 0) > 0 then
+    before, after = merge_grid_colors(cells, opts.merge_tol)
+  end
+
+  app.transaction(function()
+    if opts.output == "sprite" then
+      local ns = Sprite(nw, nh)
+      local nlayer = ns.layers[1]
+      nlayer.name = ui_labels().pp_layer_name
+      local nimg = Image(nw, nh)
+      for j = 1, nh do
+        for i = 1, nw do
+          local c = cells[j][i]
+          nimg:putPixel(i - 1, j - 1, pc.rgba(c[1], c[2], c[3], c[4]))
+        end
+      end
+      ns:newCel(nlayer, 1, nimg, Point(0, 0))
+    else
+      -- same canvas size, each cell filled as one flat block
+      local out_img = Image(w, h)
+      for j = 1, nh do
+        local y0 = math.max(0, math.ceil(ys[j]))
+        local y1 = math.min(h, math.ceil(ys[j + 1]))
+        for i = 1, nw do
+          local x0 = math.max(0, math.ceil(xs[i]))
+          local x1 = math.min(w, math.ceil(xs[i + 1]))
+          local c = cells[j][i]
+          local col = pc.rgba(c[1], c[2], c[3], c[4])
+          for y = y0, y1 - 1 do
+            for x = x0, x1 - 1 do
+              out_img:putPixel(x, y, col)
+            end
+          end
+        end
+      end
+      local nl = spr:newLayer()
+      nl.name = ui_labels().pp_layer_name
+      spr:newCel(nl, frame, out_img, Point(src.x, src.y))
+    end
+  end)
+
+  app.refresh()
+  return {
+    cell_w = cell_w,
+    cell_h = cell_h,
+    nw = nw,
+    nh = nh,
+    src_w = w,
+    src_h = h,
+    auto = auto,
+    colors_before = before,
+    colors_after = after,
+  }
+end
+
+-- ---------------------------------------------------------------------------
 -- Registration
 -- ---------------------------------------------------------------------------
 
@@ -564,6 +1031,88 @@ function init(plugin)
       if res then
         app.alert(string.format(labels.ft_summary, res.before, res.after, res.cleared))
       end
+    end,
+  }
+
+  plugin:newCommand{
+    id = "PerfectPixel",
+    title = labels.pp_title,
+    group = "edit_fx",
+    onclick = function()
+      local spr = app.activeSprite
+      if not spr then
+        app.alert(labels.no_sprite)
+        return
+      end
+      if not app.activeLayer then
+        app.alert(labels.no_layer)
+        return
+      end
+
+      local dlg = Dialog{ title = labels.pp_title }
+      if not dlg then return end
+
+      dlg:label{ label = labels.pp_about }
+      dlg:separator{}
+      dlg:combobox{
+        id = "sampling", label = labels.pp_sampling,
+        option = labels.pp_s_majority,
+        options = { labels.pp_s_majority, labels.pp_s_center, labels.pp_s_median },
+      }
+      dlg:combobox{
+        id = "grid", label = labels.pp_grid,
+        option = labels.pp_g_auto,
+        options = { labels.pp_g_auto, labels.pp_g_manual },
+      }
+      dlg:number{ id = "grid_w", label = labels.pp_grid_w, text = "32", decimals = 0 }
+      dlg:number{ id = "grid_h", label = labels.pp_grid_h, text = "32", decimals = 0 }
+      dlg:number{ id = "merge", label = labels.pp_merge, text = "10", decimals = 0 }
+      dlg:separator{}
+      dlg:combobox{
+        id = "output", label = labels.pp_output,
+        option = labels.pp_o_sprite,
+        options = { labels.pp_o_sprite, labels.pp_o_layer },
+      }
+      dlg:separator{}
+      dlg:button{ id = "ok", text = "OK", focus = true }
+      dlg:button{ id = "cancel", text = "Cancel" }
+      dlg:show()
+
+      local data = dlg.data
+      if not data.ok then return end
+
+      local method = "majority"
+      if data.sampling == labels.pp_s_center then method = "center"
+      elseif data.sampling == labels.pp_s_median then method = "median" end
+
+      local manual = (data.grid == labels.pp_g_manual)
+      local out_sprite = (data.output == labels.pp_o_sprite)
+
+      local res, err = perfect_pixel_restore{
+        method = method,
+        grid_w = manual and data.grid_w or 0,
+        grid_h = manual and data.grid_h or 0,
+        merge_tol = math.max(0, math.min(255, data.merge or 0)),
+        output = out_sprite and "sprite" or "layer",
+        frame = app.frame,
+      }
+      if not res then
+        app.alert(err == "pp_fail" and labels.pp_fail or labels.no_layer)
+        return
+      end
+      if res.auto and (res.cell_w < 4 or res.cell_w > 20 or res.cell_h < 4 or res.cell_h > 20) then
+        app.alert(string.format(labels.pp_bad_size, res.cell_w, res.cell_h))
+      end
+      local msg
+      if out_sprite then
+        msg = string.format(labels.pp_result_sprite, res.cell_w, res.cell_h, res.nw, res.nh)
+      else
+        msg = string.format(labels.pp_result_layer, res.cell_w, res.cell_h, res.nw, res.nh)
+      end
+      if res.colors_before then
+        msg = msg .. " " .. string.format(labels.pp_colors, res.colors_before, res.colors_after)
+      end
+      app.alert(msg)
     end,
   }
 end
