@@ -94,6 +94,32 @@ Each cell is sampled independently, so cells sharing one true colour still diffe
 by a few units — that is why the merge step exists (upstream expects a separate
 quantisation pass; here `Flatten Colors` can do it too).
 
+### 5. Redraw Outline
+
+`Edit → FX → Redraw Outline` (`编辑 → FX → 重绘描边`).
+
+Takes artwork whose outline is uneven — mixed colours, 1 px here and 2 px there —
+and redraws it as one flat colour at exactly one width.
+
+| Option | Meaning |
+|---|---|
+| Outline width | The new outline's thickness in px (1–8) |
+| Outline color | One flat colour for the whole outline |
+| Strip old outline | How many outer layers of the existing silhouette to peel off first. Set it to the **maximum** width of the old outline; `0` just adds a clean outline around the artwork as-is |
+| Output | Replace the current layer, or put the redrawn copy on a new layer above |
+
+The outline is the ring of pixels touching the peeled shape, including diagonal
+touches — the same shape a hand-drawn pixel-art outline has, corners included.
+
+Two things worth knowing:
+
+- Stripping peels **layers of the silhouette**, it cannot tell outline from
+  artwork. Wherever the old outline was thinner than the strip amount, one layer
+  of the artwork itself is peeled too. Prefer redrawing over iterating small
+  changes, or use the new-layer output to compare.
+- Peeling too far empties thin parts of the shape; the command refuses with a
+  message instead of erasing them silently.
+
 ## Install
 
 Copy `package.json` and `aseprite_better.lua` into:

@@ -76,6 +76,18 @@ local function ui_labels()
       pp_result_sprite = "检测到像素格 %.2f × %.2f px，已新建精灵 %d × %d。",
       pp_merge = "合并相近颜色（0 = 关闭）",
       pp_colors = "颜色 %d → %d。",
+      -- redraw outline command
+      ro_title = "重绘描边",
+      ro_about = "剥离旧描边层，再以统一颜色、统一宽度重新描边。",
+      ro_width = "描边宽度（px）",
+      ro_color = "描边颜色",
+      ro_strip = "剥离旧描边（px）",
+      ro_output = "输出到",
+      ro_o_replace = "替换当前图层",
+      ro_o_layer = "新建图层（当前层上方）",
+      ro_layer_name = "描边",
+      ro_fail = "剥离层数太大，图形被剥空了。请调小“剥离旧描边”。",
+      ro_summary = "描边已重绘：宽度 %d px，描边像素 %d 个。",
     }
   end
   return {
@@ -132,6 +144,17 @@ local function ui_labels()
     pp_result_sprite = "Detected %.2f × %.2f px per cell; created a new %d × %d sprite.",
     pp_merge = "Merge similar colors (0 = off)",
     pp_colors = "Colors %d → %d.",
+    ro_title = "Redraw Outline",
+    ro_about = "Strip the old outline layers, then redraw with one color and one width.",
+    ro_width = "Outline width (px)",
+    ro_color = "Outline color",
+    ro_strip = "Strip old outline (px)",
+    ro_output = "Output",
+    ro_o_replace = "Replace current layer",
+    ro_o_layer = "New layer (above current)",
+    ro_layer_name = "Outline",
+    ro_fail = "Stripping removed the whole shape. Lower the strip amount.",
+    ro_summary = "Outline redrawn: %d px wide, %d outline pixels.",
   }
 end
 
@@ -924,6 +947,172 @@ function perfect_pixel_restore(opts)
 end
 
 -- ---------------------------------------------------------------------------
+-- 5. Redraw Outline
+-- ---------------------------------------------------------------------------
+
+-- 4-neighbour morphology on a flat boolean mask (1-based indices).
+local function erode_mask(mask, w, h)
+  local out = {}
+  local function m(x, y)
+    if x < 1 or x > w or y < 1 or y > h then return false end
+    return mask[y * w + x]
+  end
+  for y = 1, h do
+    for x = 1, w do
+      out[y * w + x] = m(x, y) and m(x - 1, y) and m(x + 1, y) and m(x, y - 1) and m(x, y + 1)
+    end
+  end
+  return out
+end
+
+-- Dilation uses 8-neighbourhood: a hand-drawn pixel-art outline covers every
+-- transparent pixel that touches the shape, including diagonals, so square
+-- outlines keep their corners instead of coming out chamfered.
+local function dilate_mask(mask, w, h)
+  local out = {}
+  local function m(x, y)
+    if x < 1 or x > w or y < 1 or y > h then return false end
+    return mask[y * w + x]
+  end
+  for y = 1, h do
+    for x = 1, w do
+      out[y * w + x] = m(x, y) or m(x - 1, y) or m(x + 1, y) or m(x, y - 1) or m(x, y + 1)
+        or m(x - 1, y - 1) or m(x + 1, y - 1) or m(x - 1, y + 1) or m(x + 1, y + 1)
+    end
+  end
+  return out
+end
+
+-- Strip the old outline (erode the opaque silhouette `strip` times), then grow
+-- the remaining core back out by `width` px and fill that ring with one flat
+-- colour. Whatever the old outline looked like — mixed colours, uneven
+-- thickness — the result is one colour at exactly `width` px.
+--
+-- opts fields:
+--   layer       Layer (defaults to the active layer)
+--   width       number, new outline thickness in px (1..8)
+--   strip       number, outer layers to remove first (0..8)
+--   color       Color, the outline colour
+--   output      "replace" | "layer"
+--   all_frames  boolean
+-- Returns { width = n, pixels = n } or nil + "ro_fail".
+function redraw_outline(opts)
+  local spr = app.activeSprite
+  if not spr then return nil end
+  local layer = opts.layer or app.activeLayer
+  if not layer then return nil end
+
+  local width = math.max(1, math.min(8, math.floor(opts.width or 1)))
+  local strip = math.max(0, math.min(8, math.floor(opts.strip or 1)))
+  local ocol = opts.color or Color{ r = 0, g = 0, b = 0, a = 255 }
+  local packed = pc.rgba(ocol.red, ocol.green, ocol.blue, ocol.alpha or 255)
+
+  local frames = frames_to_process(spr, { all_frames = opts.all_frames })
+  local outline_pixels = 0
+
+  -- First pass on every frame: build the redrawn image. If any frame erodes
+  -- to nothing we abort before writing anything.
+  local results = {}
+  for _, frame in ipairs(frames) do
+    local cel = layer:cel(frame)
+    if cel then
+      local iw, ih = cel.image.width, cel.image.height
+      local pad = width + 1
+      local w, h = iw + 2 * pad, ih + 2 * pad
+      local mask, colors = {}, {}
+      for y = 0, ih - 1 do
+        for x = 0, iw - 1 do
+          local v = cel.image:getPixel(x, y)
+          if pc.rgbaA(v) > 0 then
+            local px, py = x + pad + 1, y + pad + 1
+            mask[py * w + px] = true
+            colors[py * w + px] = v
+          end
+        end
+      end
+
+      for _ = 1, strip do
+        mask = erode_mask(mask, w, h)
+      end
+      local any = false
+      for i = 1, w * h do
+        if mask[i] then any = true break end
+      end
+      if not any then return nil, "ro_fail" end
+
+      local core = mask
+      for _ = 1, width do
+        core = dilate_mask(core, w, h)
+      end
+
+      -- bounds of the grown silhouette
+      local minx, miny, maxx, maxy = w, h, 1, 1
+      for y = 1, h do
+        for x = 1, w do
+          if core[y * w + x] then
+            if x < minx then minx = x end
+            if x > maxx then maxx = x end
+            if y < miny then miny = y end
+            if y > maxy then maxy = y end
+          end
+        end
+      end
+
+      local nw, nh = maxx - minx + 1, maxy - miny + 1
+      local img = Image(nw, nh)
+      local count = 0
+      for y = 0, nh - 1 do
+        for x = 0, nw - 1 do
+          local idx = (miny + y) * w + (minx + x)
+          if core[idx] then
+            if mask[idx] then
+              img:putPixel(x, y, colors[idx] or packed)
+            else
+              img:putPixel(x, y, packed)
+              count = count + 1
+            end
+          end
+        end
+      end
+      outline_pixels = outline_pixels + count
+      results[#results + 1] = {
+        frame = frame,
+        img = img,
+        pos = Point(cel.position.x - pad + minx - 1, cel.position.y - pad + miny - 1),
+      }
+    end
+  end
+
+  local labels = ui_labels()
+  app.transaction(function()
+    local new_layer = nil
+    if opts.output == "layer" then
+      new_layer = spr:newLayer()
+      new_layer.name = labels.ro_layer_name
+      new_layer.stackIndex = layer.stackIndex + 1
+    end
+    for _, r in ipairs(results) do
+      if new_layer then
+        local existing = new_layer:cel(r.frame)
+        if existing then
+          existing.image = r.img
+          existing.position = r.pos
+        else
+          spr:newCel(new_layer, r.frame, r.img, r.pos)
+        end
+      else
+        local cel = layer:cel(r.frame)
+        cel.image = r.img
+        cel.position = r.pos
+      end
+    end
+  end)
+
+  app.refresh()
+  return { width = width, pixels = outline_pixels }
+end
+
+-- ---------------------------------------------------------------------------
 -- Registration
 -- ---------------------------------------------------------------------------
 
@@ -1151,6 +1340,64 @@ function init(plugin)
         msg = msg .. " " .. string.format(labels.pp_colors, res.colors_before, res.colors_after)
       end
       app.alert(msg)
+    end,
+  }
+
+  plugin:newCommand{
+    id = "RedrawOutline",
+    title = labels.ro_title,
+    group = "edit_fx",
+    onclick = function()
+      local spr = app.activeSprite
+      if not spr then
+        app.alert(labels.no_sprite)
+        return
+      end
+      if not app.activeLayer then
+        app.alert(labels.no_layer)
+        return
+      end
+
+      local dlg = Dialog{ title = labels.ro_title }
+      if not dlg then return end
+
+      dlg:label{ label = labels.ro_about }
+      dlg:separator{}
+      dlg:number{ id = "width", label = labels.ro_width, text = "1", decimals = 0 }
+      dlg:color{ id = "color", label = labels.ro_color, color = Color{ r = 0, g = 0, b = 0, a = 255 } }
+      dlg:number{ id = "strip", label = labels.ro_strip, text = "1", decimals = 0 }
+      dlg:separator{}
+      dlg:combobox{
+        id = "output", label = labels.ro_output,
+        option = labels.ro_o_replace,
+        options = { labels.ro_o_replace, labels.ro_o_layer },
+      }
+      dlg:combobox{
+        id = "scope", label = labels.scope,
+        option = labels.scope_cel,
+        options = { labels.scope_cel, labels.scope_frames },
+      }
+      dlg:separator{}
+      dlg:button{ id = "ok", text = "OK", focus = true }
+      dlg:button{ id = "cancel", text = "Cancel" }
+      dlg:show()
+
+      local data = dlg.data
+      if not data.ok then return end
+
+      local res, err = redraw_outline{
+        layer = app.activeLayer,
+        width = data.width,
+        color = data.color,
+        strip = data.strip,
+        output = (data.output == labels.ro_o_layer) and "layer" or "replace",
+        all_frames = (data.scope == labels.scope_frames),
+      }
+      if not res then
+        app.alert(err == "ro_fail" and labels.ro_fail or labels.no_layer)
+        return
+      end
+      app.alert(string.format(labels.ro_summary, res.width, res.pixels))
     end,
   }
 end
