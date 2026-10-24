@@ -94,61 +94,35 @@ Each cell is sampled independently, so cells sharing one true colour still diffe
 by a few units — that is why the merge step exists (upstream expects a separate
 quantisation pass; here `Flatten Colors` can do it too).
 
-### 5. Redraw Outline
+### 5. Redraw Dark Outline
 
-`Edit → FX → Redraw Outline` (`编辑 → FX → 重绘描边`).
+`Edit → FX → Redraw Dark Outline` (`编辑 → FX → 重绘黑边`).
 
-Takes artwork whose outline is uneven — mixed colours, 1 px here and 2 px there —
-and redraws it as one flat colour at exactly one width.
+Detects **every dark contour line** in the artwork — pure black, grey-black,
+blue-black, any colour whose luminance is at or below the threshold — and redraws
+them all as one colour at exactly one width. Uneven, muddy outlines become a
+clean uniform line.
 
 | Option | Meaning |
 |---|---|
-| Outline width | The new outline's thickness in px (1–8) |
-| Outline color | One flat colour for the whole outline |
-| Strip old outline | How many outer layers of the existing silhouette to peel off first. Set it to the **maximum** width of the old outline; `0` just adds a clean outline around the artwork as-is |
-| Output | Replace the current layer, or put the redrawn copy on a new layer above |
+| Dark threshold | Luminance at or below this counts as outline (0–255). `60` catches grey-blacks and blue-blacks |
+| Outline width | Target thickness in px (1–8). Odd widths are exact; even widths are grown one-sided, so they are exact on straight runs |
+| Outline color | One flat colour for every redrawn line |
+| Max existing outline width | Dark pixels deeper than this inside a dark area count as **fill**, not outline — a black shirt or a dark shadow stays intact, only its rim is treated as a line |
 
-The outline is the ring of pixels touching the peeled shape, including diagonal
-touches — the same shape a hand-drawn pixel-art outline has, corners included.
+How it works: the dark mask is thinned to a 1-px centreline (Zhang-Suen), grown
+back to the target width, and painted in the outline colour. Pixels that were
+outline but fall outside the redrawn line are resolved towards whichever is
+nearer — the surrounding artwork (filled with its colour) or transparency
+(dropped) — so thick old lines taper cleanly instead of leaving holes.
 
-Two things worth knowing:
+Notes:
 
-- Stripping peels **layers of the silhouette**, it cannot tell outline from
-  artwork. Wherever the old outline was thinner than the strip amount, one layer
-  of the artwork itself is peeled too. Prefer redrawing over iterating small
-  changes, or use the new-layer output to compare.
-- Peeling too far empties thin parts of the shape; the command refuses with a
-  message instead of erasing them silently.
-
-## Install
-
-Copy `package.json` and `aseprite_better.lua` into:
-
-```
-%APPDATA%\Aseprite\extensions\aseprite-better\
-```
-
-Then restart Aseprite. Or double-click the packaged `.aseprite-extension` file.
-
-## Usage
-
-- Toggle bottom layer: bind a shortcut in `Edit → Keyboard Shortcuts` (search
-  "Toggle Visibility of Bottom Layer" / "切换最底层可见性"). It also appears in the
-  Layer menu.
-- Drop shadow: `Edit → FX → Drop Shadow` (`编辑 → FX → 投影`).
-
-Both command titles follow the Aseprite UI language (Chinese or English).
-
-## Implementation notes
-
-- `sprite.layers` is ordered bottom-to-top: `layers[1]` is the bottom layer.
-- Aseprite's Lua API has no layer-reorder function, but `Layer.stackIndex` is
-  writable — the shadow layer uses it to insert itself directly below the source layer.
-- The current frame is `app.frame` (there is no `sprite.frame`).
-- Aseprite ships no blur filter, so the soft-shadow mode uses a hand-written
-  separable box blur over the alpha channel.
-- Merge mode grows the cel to cover artwork + shadow, then writes shadow pixels
-  only where the artwork is transparent, so original pixels are never overwritten.
+- Detection is by colour only: dark *details* inside the artwork (pupils,
+  shadow spots) are also detected when they fall under the threshold. Raise the
+  threshold or lower `max existing outline width` to protect them.
+- The whole computation is pure Lua over the cel; very large images take a
+  moment.
 
 ## License
 
