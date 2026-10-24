@@ -47,6 +47,8 @@ local function ui_labels()
       flatten_title = "扁平化",
       flatten_about = "把相近的颜色归并成同一个颜色，并清除半透明像素。",
       ft_tolerance = "相似色合并阈值",
+      ft_black = "黑色阈值（0 = 关闭）",
+      ft_black_hit = "吸附到纯黑 %d 个像素。",
       ft_clear = "清除半透明像素（0<不透明度<100%）",
       ft_indexed = "索引色模式暂不支持，请先转为 RGB 模式（精灵 → 色彩模式 → RGB）。",
       ft_summary = "扁平化完成：颜色 %d → %d，清除半透明像素 %d 个。",
@@ -102,6 +104,8 @@ local function ui_labels()
     flatten_title = "Flatten Colors",
     flatten_about = "Merge similar colors into one and clear semi-transparent pixels.",
     ft_tolerance = "Color merge tolerance",
+    ft_black = "Black threshold (0 = off)",
+    ft_black_hit = "Snapped %d pixel(s) to pure black.",
     ft_clear = "Clear semi-transparent pixels (0 < alpha < 100%)",
     ft_indexed = "Indexed color mode is not supported. Convert to RGB first (Sprite → Color Mode → RGB).",
     ft_summary = "Flattened: %d colors → %d, cleared %d semi-transparent pixel(s).",
@@ -366,9 +370,11 @@ end
 -- opts fields:
 --   layer        Layer (defaults to the active layer)
 --   tolerance    number, max RGB distance for two colors to be merged (0..255)
+--   black_tol    number, every channel of a near-black color must be <= this
+--                to snap it to pure black (0 = off)
 --   clear_semi   boolean, clear pixels with 0 < alpha < 255 (default true)
 --   all_frames   boolean
--- Returns a table { before = n, after = n, cleared = n }.
+-- Returns a table { before = n, after = n, cleared = n, black = n }.
 function flatten_colors(opts)
   local spr = app.activeSprite
   if not spr then return nil end
@@ -377,6 +383,7 @@ function flatten_colors(opts)
   if spr.colorMode == ColorMode.INDEXED then return nil end
 
   local tol = math.max(0, math.min(255, math.floor(opts.tolerance or 24)))
+  local black_tol = math.max(0, math.min(255, math.floor(opts.black_tol or 0)))
   local tol2 = tol * tol
   local clear_semi = opts.clear_semi
   if clear_semi == nil then clear_semi = true end
@@ -385,6 +392,7 @@ function flatten_colors(opts)
   local counts, keys = {}, {}
   local centers, map = {}, {}
   local cleared = 0
+  local black_snapped = 0
 
   local function color_key(r, g, b)
     return r * 65536 + g * 256 + b
@@ -424,25 +432,48 @@ function flatten_colors(opts)
     -- cluster: walk colors from most to least frequent, keep a color as a new
     -- cluster center only when it is not already close to an existing one
     table.sort(keys, function(a, b) return counts[a] > counts[b] end)
-    for _, key in ipairs(keys) do
-      local r = math.floor(key / 65536) % 256
-      local g = math.floor(key / 256) % 256
-      local b = key % 256
-      local best, best_d = nil, math.huge
-      for _, c in ipairs(centers) do
-        local dr, dg, db = r - c[1], g - c[2], b - c[3]
-        local d = dr * dr + dg * dg + db * db
-        if d < best_d then
-          best_d = d
-          best = c
+
+    -- Black gets its own threshold: any color with every channel at or below
+    -- black_tol is snapped to pure black before the normal merge runs. The
+    -- threshold is per channel (not Euclidean) because "near black" means all
+    -- three channels are low, and that is how the number is easiest to reason
+    -- about. Pure black then joins the cluster centers, so later colors may
+    -- still merge into it under the normal tolerance.
+    if black_tol > 0 then
+      local black = { 0, 0, 0 }
+      centers[#centers + 1] = black
+      for _, key in ipairs(keys) do
+        local r = math.floor(key / 65536) % 256
+        local g = math.floor(key / 256) % 256
+        local b = key % 256
+        if r <= black_tol and g <= black_tol and b <= black_tol then
+          map[key] = black
+          black_snapped = black_snapped + counts[key]
         end
       end
-      if best and best_d <= tol2 then
-        map[key] = best
-      else
-        local c = { r, g, b }
-        centers[#centers + 1] = c
-        map[key] = c
+    end
+
+    for _, key in ipairs(keys) do
+      if not map[key] then
+        local r = math.floor(key / 65536) % 256
+        local g = math.floor(key / 256) % 256
+        local b = key % 256
+        local best, best_d = nil, math.huge
+        for _, c in ipairs(centers) do
+          local dr, dg, db = r - c[1], g - c[2], b - c[3]
+          local d = dr * dr + dg * dg + db * db
+          if d < best_d then
+            best_d = d
+            best = c
+          end
+        end
+        if best and best_d <= tol2 then
+          map[key] = best
+        else
+          local c = { r, g, b }
+          centers[#centers + 1] = c
+          map[key] = c
+        end
       end
     end
 
@@ -468,7 +499,7 @@ function flatten_colors(opts)
   end)
 
   app.refresh()
-  return { before = #keys, after = #centers, cleared = cleared }
+  return { before = #keys, after = #centers, cleared = cleared, black = black_snapped }
 end
 
 -- ---------------------------------------------------------------------------
@@ -1008,6 +1039,7 @@ function init(plugin)
       dlg:label{ label = labels.flatten_about }
       dlg:separator{}
       dlg:number{ id = "tolerance", label = labels.ft_tolerance, text = "24", decimals = 0 }
+      dlg:number{ id = "black_tol", label = labels.ft_black, text = "0", decimals = 0 }
       dlg:check{ id = "clear_semi", text = labels.ft_clear, selected = true }
       dlg:separator{}
       dlg:combobox{
@@ -1026,11 +1058,16 @@ function init(plugin)
       local res = flatten_colors{
         layer = app.activeLayer,
         tolerance = data.tolerance,
+        black_tol = data.black_tol,
         clear_semi = data.clear_semi,
         all_frames = (data.scope == labels.scope_frames),
       }
       if res then
-        app.alert(string.format(labels.ft_summary, res.before, res.after, res.cleared))
+        local msg = string.format(labels.ft_summary, res.before, res.after, res.cleared)
+        if res.black and res.black > 0 then
+          msg = msg .. " " .. string.format(labels.ft_black_hit, res.black)
+        end
+        app.alert(msg)
       end
     end,
   }

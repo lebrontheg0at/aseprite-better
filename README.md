@@ -49,6 +49,14 @@ flattening stays consistent over an animation.
 A summary is shown afterwards, e.g. `Flattened: 118 colors → 24, cleared 312
 semi-transparent pixel(s)`.
 
+**Black threshold** is a separate tolerance measured from pure black: any color
+whose **every channel** is at or below the value is snapped to `#000000` before
+the normal merge runs. That is how dark noise, off-black outlines and near-black
+shadows collapse into one true black instead of a cluster of slightly different
+dark greys. `0` disables it. It is per channel, so `16` catches everything up to
+`(16,16,16)` — easier to reason about than a Euclidean radius for this case. The
+regular merge tolerance still uses Euclidean RGB distance.
+
 Not supported in Indexed color mode (convert with `Sprite → Color Mode → RGB`
 first).
 
@@ -69,8 +77,9 @@ noisy "fake pixel art" edges back into crisp pixel blocks.
 
 Algorithm reference: [Perfect Pixel](https://github.com/theamusing/perfectPixel)
 by theAmusing (MIT) — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the
-full attribution and license text. — grid size estimated from gradient profiles, each grid line
-then snapped to the strongest nearby edge, then one sample per cell. This is an
+full attribution and license text. Grid size is estimated from gradient profiles,
+each grid line is then snapped to the strongest nearby edge, and one sample is
+taken per cell. This is an
 independent Lua implementation for Aseprite, with three deliberate differences:
 
 - Only the gradient estimator is ported; the upstream FFT estimator is not.
