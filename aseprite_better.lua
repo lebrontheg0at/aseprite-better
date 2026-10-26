@@ -76,19 +76,19 @@ local function ui_labels()
       pp_result_sprite = "检测到像素格 %.2f × %.2f px，已新建精灵 %d × %d。",
       pp_merge = "合并相近颜色（0 = 关闭）",
       pp_colors = "颜色 %d → %d。",
-      -- redraw dark outline command
-      ro_title = "重绘黑边",
-      ro_about = "检测所有深色轮廓线（灰黑/蓝黑等都算），统一为指定颜色和指定宽度。",
-      ro_dark = "黑边判定阈值（亮度 ≤）",
-      ro_width = "描边宽度（px）",
-      ro_color = "描边颜色",
-      ro_max_old = "最大原黑边宽度（更厚的深色区视为填色）",
+      -- redraw contour command
+      ro_title = "重绘轮廓",
+      ro_about = "检测所有细的深色轮廓线（灰黑/蓝黑等都算），统一为指定颜色和宽度；较宽的深色块保持不动。",
+      ro_dark = "深色判定阈值（亮度 ≤）",
+      ro_max_line = "轮廓最大宽度（更宽的深色块不处理）",
+      ro_width = "轮廓宽度（px）",
+      ro_color = "轮廓颜色",
       ro_output = "输出到",
       ro_o_replace = "替换当前图层",
       ro_o_layer = "新建图层（当前层上方）",
-      ro_layer_name = "黑边",
-      ro_fail = "没有检测到符合条件的黑边。可尝试调大判定阈值。",
-      ro_summary = "黑边已重绘：宽度 %d px，描边 %d 像素，修整 %d 像素。",
+      ro_layer_name = "轮廓",
+      ro_fail = "没有检测到符合条件的深色轮廓。可尝试调大深色判定阈值或轮廓最大宽度。",
+      ro_summary = "已重绘 %d 条轮廓：宽度 %d px，轮廓 %d 像素，修整 %d 像素。",
     }
   end
   return {
@@ -145,18 +145,18 @@ local function ui_labels()
     pp_result_sprite = "Detected %.2f × %.2f px per cell; created a new %d × %d sprite.",
     pp_merge = "Merge similar colors (0 = off)",
     pp_colors = "Colors %d → %d.",
-    ro_title = "Redraw Dark Outline",
-    ro_about = "Detect every dark contour line (grey-black, blue-black, ...) and redraw them all with one color at one width.",
+    ro_title = "Redraw Contour",
+    ro_about = "Detect thin dark contour lines (grey-black, blue-black, ...) and redraw them at one color and width; thicker dark blocks are left alone.",
     ro_dark = "Dark threshold (luminance ≤)",
-    ro_width = "Outline width (px)",
-    ro_color = "Outline color",
-    ro_max_old = "Max existing outline width (thicker dark areas count as fill)",
+    ro_max_line = "Max contour width (thicker dark blocks are skipped)",
+    ro_width = "Contour width (px)",
+    ro_color = "Contour color",
     ro_output = "Output",
     ro_o_replace = "Replace current layer",
     ro_o_layer = "New layer (above current)",
-    ro_layer_name = "Dark outline",
-    ro_fail = "No matching dark outline was detected. Try raising the dark threshold.",
-    ro_summary = "Dark outline redrawn: %d px wide, %d outline pixels, %d pixels adjusted.",
+    ro_layer_name = "Contour",
+    ro_fail = "No dark contour matched. Try raising the dark threshold or the max contour width.",
+    ro_summary = "%d contour(s) redrawn at %d px: %d contour pixels, %d pixels adjusted.",
   }
 end
 
@@ -949,16 +949,15 @@ function perfect_pixel_restore(opts)
 end
 
 -- ---------------------------------------------------------------------------
--- 5. Redraw Dark Outline
+-- 5. Redraw Contour
 -- ---------------------------------------------------------------------------
 
--- ITU-R BT.601 luma, the same weights Aseprite's Lua examples use.
+-- ITU-R BT.601 luma.
 local function lum_of(r, g, b)
   return 0.299 * r + 0.587 * g + 0.114 * b
 end
 
--- Zhang-Suen thinning: reduces every stroke in the mask to a connected
--- 1-px centreline. Mutates and returns the mask.
+-- Zhang-Suen thinning: reduces a stroke mask to a connected 1-px centreline.
 local function thin_mask(mask, w, h)
   local function at(x, y)
     if x < 1 or x > w or y < 1 or y > h then return false end
@@ -1009,7 +1008,6 @@ local function thin_mask(mask, w, h)
   return mask
 end
 
--- Symmetric 4-connected dilation: k passes grow a 1-px line to 2k+1 px.
 local function dilate4(mask, w, h)
   local out = {}
   for y = 1, h do
@@ -1028,7 +1026,6 @@ local function dilate4(mask, w, h)
   return out
 end
 
--- One-sided dilation (east + south), applied once to reach even widths.
 local function dilate_es(mask, w, h)
   local out = {}
   for y = 1, h do
@@ -1044,9 +1041,39 @@ local function dilate_es(mask, w, h)
   return out
 end
 
--- Multi-source BFS through `passable` cells. Each seed carries a payload
--- (a packed colour, or the string "transparent") that spreads with the wave.
--- Returns dist and payload tables.
+-- Distance (in px, 4-connected) from every masked cell to the nearest cell
+-- outside the mask: 1 for a lone 1-px line, 2 for the centre of a 3-px line.
+local function distance_inside(mask, w, h)
+  local dist = {}
+  local queue, qh = {}, 1
+  for y = 1, h do
+    for x = 1, w do
+      local i = y * w + x
+      if mask[i] then
+        local edge = (x == 1) or (x == w) or (y == 1) or (y == h)
+          or (not mask[i - 1]) or (not mask[i + 1])
+          or (not mask[i - w]) or (not mask[i + w])
+        if edge then
+          dist[i] = 1
+          queue[#queue + 1] = i
+        end
+      end
+    end
+  end
+  while qh <= #queue do
+    local i = queue[qh]
+    qh = qh + 1
+    local x = (i - 1) % w + 1
+    local y = math.floor((i - 1) / w) + 1
+    local d = dist[i] + 1
+    if x > 1 and mask[i - 1] and dist[i - 1] == nil then dist[i - 1] = d; queue[#queue + 1] = i - 1 end
+    if x < w and mask[i + 1] and dist[i + 1] == nil then dist[i + 1] = d; queue[#queue + 1] = i + 1 end
+    if y > 1 and mask[i - w] and dist[i - w] == nil then dist[i - w] = d; queue[#queue + 1] = i - w end
+    if y < h and mask[i + w] and dist[i + w] == nil then dist[i + w] = d; queue[#queue + 1] = i + w end
+  end
+  return dist
+end
+
 local function bfs_through(w, h, seeds, passable)
   local dist, pay = {}, {}
   local queue, qh = {}, 1
@@ -1062,52 +1089,56 @@ local function bfs_through(w, h, seeds, passable)
     qh = qh + 1
     local x = (i - 1) % w + 1
     local y = math.floor((i - 1) / w) + 1
+    local d = dist[i] + 1
     if x > 1 and dist[i - 1] == nil and passable[i - 1] then
-      dist[i - 1] = dist[i] + 1; pay[i - 1] = pay[i]; queue[#queue + 1] = i - 1
+      dist[i - 1] = d; pay[i - 1] = pay[i]; queue[#queue + 1] = i - 1
     end
     if x < w and dist[i + 1] == nil and passable[i + 1] then
-      dist[i + 1] = dist[i] + 1; pay[i + 1] = pay[i]; queue[#queue + 1] = i + 1
+      dist[i + 1] = d; pay[i + 1] = pay[i]; queue[#queue + 1] = i + 1
     end
     if y > 1 and dist[i - w] == nil and passable[i - w] then
-      dist[i - w] = dist[i] + 1; pay[i - w] = pay[i]; queue[#queue + 1] = i - w
+      dist[i - w] = d; pay[i - w] = pay[i]; queue[#queue + 1] = i - w
     end
     if y < h and dist[i + w] == nil and passable[i + w] then
-      dist[i + w] = dist[i] + 1; pay[i + w] = pay[i]; queue[#queue + 1] = i + w
+      dist[i + w] = d; pay[i + w] = pay[i]; queue[#queue + 1] = i + w
     end
   end
   return dist, pay
 end
 
--- Detect every dark contour line — grey-black, blue-black, anything whose
--- luma is at or below the threshold — and redraw them all as one colour at
--- exactly one width. Dark areas thicker than `max_old` from any boundary are
--- treated as fill and left alone.
+-- Redraw every dark *contour* at one colour and one width.
+--
+-- "Contour" is decided per connected dark region by measuring its stroke
+-- width (2 * deepest interior distance - 1): regions up to `max_line_width`
+-- px thick are contours and get redrawn, anything thicker is a filled dark
+-- shape and is left completely untouched. That is what keeps big black
+-- blocks, dark clothing and heavy shadows intact.
 --
 -- opts fields:
 --   layer          Layer (defaults to the active layer)
---   dark_threshold number 0..255, luma at or below this counts as outline
---   width          number, target outline thickness in px (1..8)
---   color          Color, the new outline colour
---   max_old        number, dark pixels deeper than this from a boundary are fill
+--   dark_threshold number 0..255, luma at or below this counts as dark
+--   max_line_width number, dark regions thicker than this are fill (not contour)
+--   width          number, target contour thickness in px (1..8)
+--   color          Color, the contour colour
 --   output         "replace" | "layer"
 --   all_frames     boolean
--- Returns { width = n, pixels = n, adjusted = n } or nil + "ro_fail".
-function redraw_dark_outline(opts)
+-- Returns { width, contours, pixels, adjusted } or nil + "ro_fail".
+function redraw_contour(opts)
   local spr = app.activeSprite
   if not spr then return nil end
   local layer = opts.layer or app.activeLayer
   if not layer then return nil end
 
   local thr = math.max(0, math.min(255, math.floor(opts.dark_threshold or 60)))
-  local width = math.max(1, math.min(8, math.floor(opts.width or 1)))
-  local max_old = math.max(1, math.min(32, math.floor(opts.max_old or 6)))
+  local max_line = math.max(1, math.min(32, math.floor(opts.max_line_width or 5)))
+  local width = math.max(1, math.min(8, math.floor(opts.width or 2)))
   local ocol = opts.color or Color{ r = 0, g = 0, b = 0, a = 255 }
   local packed = pc.rgba(ocol.red, ocol.green, ocol.blue, ocol.alpha or 255)
 
   local frames = frames_to_process(spr, { all_frames = opts.all_frames })
-  local total_new, total_adj = 0, 0
-
   local results = {}
+  local total_contours, total_px, total_adj = 0, 0, 0
+
   for _, frame in ipairs(frames) do
     local cel = layer:cel(frame)
     if cel then
@@ -1116,8 +1147,7 @@ function redraw_dark_outline(opts)
       local w, h = iw + 2 * pad, ih + 2 * pad
       local n = w * h
 
-      local colors = {}  -- packed pixel where opaque; nil where transparent
-      local dark = {}
+      local colors, dark = {}, {}
       for y = 0, ih - 1 do
         for x = 0, iw - 1 do
           local v = cel.image:getPixel(x, y)
@@ -1131,134 +1161,118 @@ function redraw_dark_outline(opts)
         end
       end
 
-      -- distance from the dark region's boundary: seed the BFS with every
-      -- non-dark pixel that touches a dark one
-      local dist, queue, qh = {}, {}, 1
-      local function try_seed(j)
-        if dist[j] == nil then
-          dist[j] = 0
-          queue[#queue + 1] = j
-        end
-      end
-      for i = 1, n do
-        if dark[i] then
-          local x = (i - 1) % w + 1
-          local y = math.floor((i - 1) / w) + 1
-          if x > 1 and not dark[i - 1] then try_seed(i - 1) end
-          if x < w and not dark[i + 1] then try_seed(i + 1) end
-          if y > 1 and not dark[i - w] then try_seed(i - w) end
-          if y < h and not dark[i + w] then try_seed(i + w) end
-        end
-      end
-      while qh <= #queue do
-        local i = queue[qh]
-        qh = qh + 1
-        local x = (i - 1) % w + 1
-        local y = math.floor((i - 1) / w) + 1
-        if x > 1 and dark[i - 1] and dist[i - 1] == nil then
-          dist[i - 1] = dist[i] + 1; queue[#queue + 1] = i - 1
-        end
-        if x < w and dark[i + 1] and dist[i + 1] == nil then
-          dist[i + 1] = dist[i] + 1; queue[#queue + 1] = i + 1
-        end
-        if y > 1 and dark[i - w] and dist[i - w] == nil then
-          dist[i - w] = dist[i] + 1; queue[#queue + 1] = i - w
-        end
-        if y < h and dark[i + w] and dist[i + w] == nil then
-          dist[i + w] = dist[i] + 1; queue[#queue + 1] = i + w
-        end
-      end
+      local ddist = distance_inside(dark, w, h)
 
-      local outline = {}
+      -- label dark components (8-connected) and measure each one's width
+      local visited, contour = {}, {}
+      local contours = 0
       for i = 1, n do
-        if dark[i] and dist[i] ~= nil and dist[i] <= max_old then
-          outline[i] = true
-        end
-      end
-
-      local skel = {}
-      for i = 1, n do
-        skel[i] = outline[i]
-      end
-      thin_mask(skel, w, h)
-
-      local new = skel
-      for _ = 1, math.floor((width - 1) / 2) do
-        new = dilate4(new, w, h)
-      end
-      if width % 2 == 0 then
-        new = dilate_es(new, w, h)
-      end
-
-      -- pixels that were outline but are not part of the redrawn line are
-      -- resolved towards whichever is nearer: the artwork (fill with its
-      -- colour) or transparency (drop)
-      local removed = {}
-      for i = 1, n do
-        if outline[i] and not new[i] then removed[i] = true end
-      end
-      local dA, pA, dB, pB = {}, {}, {}, {}
-      local any_removed = false
-      for i = 1, n do
-        if removed[i] then any_removed = true break end
-      end
-      if any_removed then
-        local seeds_art, seeds_tr = {}, {}
-        local function add_seed(j)
-          if not removed[j] and not new[j] and not outline[j] then
-            if colors[j] ~= nil then
-              seeds_art[#seeds_art + 1] = { idx = j, val = colors[j] }
-            else
-              seeds_tr[#seeds_tr + 1] = { idx = j, val = "transparent" }
+        if dark[i] and not visited[i] then
+          local stack, comp = { i }, {}
+          visited[i] = true
+          local maxd = 0
+          while #stack > 0 do
+            local j = table.remove(stack)
+            comp[#comp + 1] = j
+            local dj = ddist[j] or 1
+            if dj > maxd then maxd = dj end
+            local x = (j - 1) % w + 1
+            local y = math.floor((j - 1) / w) + 1
+            for dy = -1, 1 do
+              for dx = -1, 1 do
+                if dx ~= 0 or dy ~= 0 then
+                  local nx, ny = x + dx, y + dy
+                  if nx >= 1 and nx <= w and ny >= 1 and ny <= h then
+                    local k = ny * w + nx
+                    if dark[k] and not visited[k] then
+                      visited[k] = true
+                      stack[#stack + 1] = k
+                    end
+                  end
+                end
+              end
             end
           end
+          local comp_width = 2 * maxd - 1
+          if comp_width <= max_line then
+            contours = contours + 1
+            for _, j in ipairs(comp) do contour[j] = true end
+          end
         end
+      end
+
+      if contours > 0 then
+        local skel = {}
+        for i = 1, n do skel[i] = contour[i] end
+        thin_mask(skel, w, h)
+
+        local new = skel
+        for _ = 1, math.floor((width - 1) / 2) do new = dilate4(new, w, h) end
+        if width % 2 == 0 then new = dilate_es(new, w, h) end
+
+        local removed = {}
+        local any_removed = false
         for i = 1, n do
-          if removed[i] then
-            local x = (i - 1) % w + 1
-            local y = math.floor((i - 1) / w) + 1
-            if x > 1 then add_seed(i - 1) end
-            if x < w then add_seed(i + 1) end
-            if y > 1 then add_seed(i - w) end
-            if y < h then add_seed(i + w) end
+          if contour[i] and not new[i] then
+            removed[i] = true
+            any_removed = true
           end
         end
-        dA, pA = bfs_through(w, h, seeds_art, removed)
-        dB, pB = bfs_through(w, h, seeds_tr, removed)
-      end
 
-      local img = Image(w, h)
-      local cnt_new, cnt_adj = 0, 0
-      local minx, miny, maxx, maxy = w, h, 1, 1
-      for y = 1, h do
-        for x = 1, w do
-          local i = y * w + x
-          local v = nil
-          if new[i] then
-            v = packed
-            cnt_new = cnt_new + 1
-          elseif removed[i] then
-            if dA[i] ~= nil and (dB[i] == nil or dA[i] <= dB[i]) then
-              v = pA[i]
+        local dA, pA, dB, pB = {}, {}, {}, {}
+        if any_removed then
+          local sa, st = {}, {}
+          local function add_seed(j)
+            if not removed[j] and not new[j] and not contour[j] then
+              if colors[j] ~= nil then
+                sa[#sa + 1] = { idx = j, val = colors[j] }
+              else
+                st[#st + 1] = { idx = j, val = "transparent" }
+              end
             end
-            cnt_adj = cnt_adj + 1
-          else
-            v = colors[i]
           end
-          if v ~= nil then
-            img:putPixel(x - 1, y - 1, v)
-            if x < minx then minx = x end
-            if x > maxx then maxx = x end
-            if y < miny then miny = y end
-            if y > maxy then maxy = y end
+          for i = 1, n do
+            if removed[i] then
+              local x = (i - 1) % w + 1
+              local y = math.floor((i - 1) / w) + 1
+              if x > 1 then add_seed(i - 1) end
+              if x < w then add_seed(i + 1) end
+              if y > 1 then add_seed(i - w) end
+              if y < h then add_seed(i + w) end
+            end
+          end
+          dA, pA = bfs_through(w, h, sa, removed)
+          dB, pB = bfs_through(w, h, st, removed)
+        end
+
+        local img = Image(w, h)
+        local cnt_new, cnt_adj = 0, 0
+        local minx, miny, maxx, maxy = w, h, 1, 1
+        for y = 1, h do
+          for x = 1, w do
+            local i = y * w + x
+            local v
+            if new[i] then
+              v = packed
+              cnt_new = cnt_new + 1
+            elseif removed[i] then
+              if dA[i] ~= nil and (dB[i] == nil or dA[i] <= dB[i]) then
+                v = pA[i]
+              end
+              cnt_adj = cnt_adj + 1
+            else
+              v = colors[i]
+            end
+            if v ~= nil then
+              img:putPixel(x - 1, y - 1, v)
+              if x < minx then minx = x end
+              if x > maxx then maxx = x end
+              if y < miny then miny = y end
+              if y > maxy then maxy = y end
+            end
           end
         end
-      end
-      if cnt_new == 0 then
-        -- nothing detected in this frame; skip it
-      else
-        total_new = total_new + cnt_new
-        total_adj = total_adj + cnt_adj
+
         local cw, ch = maxx - minx + 1, maxy - miny + 1
         local cropped = Image(cw, ch)
         cropped:drawImage(img, Point(1 - minx, 1 - miny))
@@ -1267,6 +1281,9 @@ function redraw_dark_outline(opts)
           img = cropped,
           pos = Point(cel.position.x - pad + minx - 1, cel.position.y - pad + miny - 1),
         }
+        total_contours = total_contours + contours
+        total_px = total_px + cnt_new
+        total_adj = total_adj + cnt_adj
       end
     end
   end
@@ -1299,7 +1316,12 @@ function redraw_dark_outline(opts)
   end)
 
   app.refresh()
-  return { width = width, pixels = total_new, adjusted = total_adj }
+  return {
+    width = width,
+    contours = total_contours,
+    pixels = total_px,
+    adjusted = total_adj,
+  }
 end
 
 -- ---------------------------------------------------------------------------
@@ -1554,9 +1576,9 @@ function init(plugin)
       dlg:label{ label = labels.ro_about }
       dlg:separator{}
       dlg:number{ id = "dark", label = labels.ro_dark, text = "60", decimals = 0 }
-      dlg:number{ id = "width", label = labels.ro_width, text = "1", decimals = 0 }
+      dlg:number{ id = "max_line", label = labels.ro_max_line, text = "5", decimals = 0 }
+      dlg:number{ id = "width", label = labels.ro_width, text = "2", decimals = 0 }
       dlg:color{ id = "color", label = labels.ro_color, color = Color{ r = 0, g = 0, b = 0, a = 255 } }
-      dlg:number{ id = "max_old", label = labels.ro_max_old, text = "6", decimals = 0 }
       dlg:separator{}
       dlg:combobox{
         id = "output", label = labels.ro_output,
@@ -1576,12 +1598,12 @@ function init(plugin)
       local data = dlg.data
       if not data.ok then return end
 
-      local res, err = redraw_dark_outline{
+      local res, err = redraw_contour{
         layer = app.activeLayer,
         dark_threshold = data.dark,
+        max_line_width = data.max_line,
         width = data.width,
         color = data.color,
-        max_old = data.max_old,
         output = (data.output == labels.ro_o_layer) and "layer" or "replace",
         all_frames = (data.scope == labels.scope_frames),
       }
@@ -1589,7 +1611,7 @@ function init(plugin)
         app.alert(err == "ro_fail" and labels.ro_fail or labels.no_layer)
         return
       end
-      app.alert(string.format(labels.ro_summary, res.width, res.pixels, res.adjusted))
+      app.alert(string.format(labels.ro_summary, res.contours, res.width, res.pixels, res.adjusted))
     end,
   }
 end

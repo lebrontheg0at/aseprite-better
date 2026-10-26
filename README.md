@@ -94,35 +94,39 @@ Each cell is sampled independently, so cells sharing one true colour still diffe
 by a few units — that is why the merge step exists (upstream expects a separate
 quantisation pass; here `Flatten Colors` can do it too).
 
-### 5. Redraw Dark Outline
+### 5. Redraw Contour
 
-`Edit → FX → Redraw Dark Outline` (`编辑 → FX → 重绘黑边`).
+`Edit → FX → Redraw Contour` (`编辑 → FX → 重绘轮廓`).
 
-Detects **every dark contour line** in the artwork — pure black, grey-black,
-blue-black, any colour whose luminance is at or below the threshold — and redraws
-them all as one colour at exactly one width. Uneven, muddy outlines become a
-clean uniform line.
+Detects **thin dark contour lines** — pure black, grey-black, blue-black, anything
+whose luminance is under the threshold — and redraws them all as one colour at
+exactly one width. Thick dark shapes are recognised as fill and left untouched.
 
 | Option | Meaning |
 |---|---|
-| Dark threshold | Luminance at or below this counts as outline (0–255). `60` catches grey-blacks and blue-blacks |
-| Outline width | Target thickness in px (1–8). Odd widths are exact; even widths are grown one-sided, so they are exact on straight runs |
-| Outline color | One flat colour for every redrawn line |
-| Max existing outline width | Dark pixels deeper than this inside a dark area count as **fill**, not outline — a black shirt or a dark shadow stays intact, only its rim is treated as a line |
+| Dark threshold | Luminance at or below this counts as dark (0–255). `60` covers grey-blacks and blue-blacks |
+| Max contour width | Dark regions whose stroke width is at most this (1–32, default 5) are contours and get redrawn. Anything thicker is treated as a filled dark shape and skipped completely |
+| Contour width | Target thickness in px (1–8, default 2) |
+| Contour colour | One flat colour for every redrawn contour |
 
-How it works: the dark mask is thinned to a 1-px centreline (Zhang-Suen), grown
-back to the target width, and painted in the outline colour. Pixels that were
-outline but fall outside the redrawn line are resolved towards whichever is
-nearer — the surrounding artwork (filled with its colour) or transparency
-(dropped) — so thick old lines taper cleanly instead of leaving holes.
+How it works: the dark mask's connected regions are measured with a distance
+transform (stroke width = `2 × deepest interior distance − 1`), so a 1-px line
+reads as 1, a 4-px line as 4. Regions within `max contour width` are thinned to a
+1-px centreline, grown back to the target width and painted. Pixels of the old
+line that fall outside the new one are filled with the neighbouring artwork
+colour, or dropped to transparency, whichever is nearer.
+
+That width test is what keeps large dark blocks safe: a black silhouette, dark
+clothing or a heavy shadow is far thicker than the contour limit, so it is not
+touched at all — only genuinely line-like dark strokes are rewritten.
 
 Notes:
 
-- Detection is by colour only: dark *details* inside the artwork (pupils,
-  shadow spots) are also detected when they fall under the threshold. Raise the
-  threshold or lower `max existing outline width` to protect them.
-- The whole computation is pure Lua over the cel; very large images take a
-  moment.
+- A contour that touches a thick dark shape becomes one connected region and is
+  therefore judged by the thicker part, so it is skipped. Raise *Max contour
+  width* if the shape and its outline are fused and you want them redrawn.
+- Detection is by colour: small dark details under the threshold (pupils, dots)
+  are treated as contours as well.
 
 ## License
 
