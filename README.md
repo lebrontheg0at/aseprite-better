@@ -166,6 +166,16 @@ one representative colour (within the threshold) *and* the pixel itself does not
 match that colour. Requiring unanimity is what separates real specks from
 structure:
 
+Additionally, an **opaque pixel whose colour is a blend of two neighbouring
+colours** — grey anti-aliasing sitting between a black outline and a light fill —
+is snapped to whichever anchor it lies closer to, which hard-edges the boundary
+on the artwork's own terms. Blend detection runs in RGBA, so anchors of a
+different opacity never match. Anti-aliasing bands are often several pixels
+deep, so the scan repeats (up to 16 passes) until the image is stable; deep
+shading bands are safe because their pixels never touch both side colours at
+once. The trade-off: a deliberate 1-px mid-tone line between two flat colours
+will also be resolved to one side.
+
 - a 2-px speck has a dissenting neighbour, so *Single pixel* leaves it alone
   (switch to *Two pixels* to clean it);
 - a pixel on the boundary between two colours never has unanimous surroundings,
