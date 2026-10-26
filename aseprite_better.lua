@@ -1385,9 +1385,14 @@ end
 -- Colour comparisons include alpha, and fully transparent counts as a colour:
 -- a semi-transparent speck inside opaque artwork is noise (different alpha),
 -- and a lone pixel floating in the transparent background is noise too (its
--- neighbours all agree on "transparent"), so both get cleaned up. Ordinary
--- silhouette edges stay safe because their neighbourhood mixes artwork and
--- transparency and therefore never reaches unanimity.
+-- neighbours all agree on "transparent"), so both get cleaned up.
+--
+-- Semi-transparent pixels (0 < alpha < 255) are always treated as speckle:
+-- on a unanimous neighbourhood they take the surrounding colour, and on a
+-- mixed one (e.g. half outline black, half transparent — anti-aliasing
+-- residue on the artwork edge) they resolve to the dominant side, ties going
+-- to transparent. Fully opaque pixels on mixed boundaries are artwork and
+-- are only touched by the unanimity rule.
 --
 -- opts fields:
 --   layer      Layer (defaults to the active layer)
@@ -1444,6 +1449,33 @@ function denoise(opts)
                 -- pixel on a colour boundary, and single mode must not touch it
                 if rep and count == #neigh and differs_from(c, rep, tol2) then
                   changes[#changes + 1] = { x = x, y = y, c = rep }
+                else
+                  -- Semi-transparent pixels are always speckle in pixel art,
+                  -- even on a mixed neighbourhood. The typical case is
+                  -- anti-aliasing residue on the artwork edge: half the
+                  -- neighbours pure outline black, half pure transparent.
+                  -- Resolve to the dominant side; a tie goes to transparent,
+                  -- which is what outer-edge residue needs. Fully opaque
+                  -- pixels on mixed boundaries are artwork and stay untouched.
+                  local a = pc.rgbaA(c)
+                  if a > 0 and a < 255 then
+                    local t_count, o_list = 0, {}
+                    for _, v in ipairs(neigh) do
+                      if pc.rgbaA(v) == 0 then
+                        t_count = t_count + 1
+                      else
+                        o_list[#o_list + 1] = v
+                      end
+                    end
+                    if t_count >= #o_list then
+                      changes[#changes + 1] = { x = x, y = y, c = pc.rgba(0, 0, 0, 0) }
+                    else
+                      local orep = dominant_color(o_list, tol2)
+                      if orep and differs_from(c, orep, tol2) then
+                        changes[#changes + 1] = { x = x, y = y, c = orep }
+                      end
+                    end
+                  end
                 end
               end
             end

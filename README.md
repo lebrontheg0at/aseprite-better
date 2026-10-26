@@ -149,6 +149,18 @@ agree on "transparent", so it is erased. Ordinary silhouette edges stay safe
 because their neighbourhood mixes artwork and transparency and therefore never
 reaches unanimity.
 
+**Semi-transparent pixels (0 < alpha < 100%) are always treated as speckle.**
+With a unanimous neighbourhood they take the surrounding colour. On a mixed
+neighbourhood — the classic case being anti-aliasing residue on the artwork
+edge, half outline black and half pure transparent — they resolve to the
+dominant side: transparent when transparent neighbours are at least as many as
+opaque ones (ties included), otherwise the most common opaque neighbour colour.
+Fully opaque pixels on mixed boundaries are artwork and stay untouched.
+
+Consequence: intentional semi-transparent art (soft shadows, alpha gradients)
+gets normalised — outer semi pixels are resolved inward/outward and the region
+slowly becomes hard-edged. This command assumes pixel art with hard alpha.
+
 How the decision works: a pixel is noise when **every** neighbour agrees with
 one representative colour (within the threshold) *and* the pixel itself does not
 match that colour. Requiring unanimity is what separates real specks from
