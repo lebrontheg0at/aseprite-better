@@ -2,7 +2,7 @@
   "name": "aseprite-better",
   "displayName": "Aseprite Better",
   "description": "Quality-of-life commands for Aseprite: bottom layer toggle, drop shadows, flattening, denoise, pixel-grid restore, contour redraw",
-  "version": "1.10",
+  "version": "1.11",
   "author": {
     "name": "Saber"
   },

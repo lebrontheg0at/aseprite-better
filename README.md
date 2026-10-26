@@ -132,61 +132,38 @@ Notes:
 
 `Edit → FX → Denoise` (`编辑 → FX → 去噪点`).
 
-Replaces isolated speckle pixels with the colour around them. Unlike *Flatten
-Colors*, which quantises the whole image, this only touches pixels that do not
-belong to their neighbourhood.
+Removes speckle and import anti-aliasing while touching everything else as
+little as possible. **Hard guarantees:**
+
+- **Never fills transparent pixels** — empty areas stay empty;
+- **Never increases opacity** — a pixel can only lose alpha or keep it, never
+  gain it (soft shadows survive; intentional semi-transparency is preserved
+  except where it is erased, see below);
+- **Fully undoable** — the whole operation is one undo step (`Ctrl+Z`).
 
 | Option | Meaning |
 |---|---|
-| Mode | **Single pixel** — only a lone pixel whose entire 8-neighbourhood is one colour (and it differs from it) is replaced. **Two pixels** — additionally joins 1×2 / 2×1 specks whose combined surroundings are unanimous |
-| Colour similarity threshold | How far apart two colours may be and still count as the same (RGB distance, default 24) |
+| Mode | **Single pixel** — lone pixels only. **Two pixels** — additionally joins 1×2 / 2×1 specks |
+| Colour similarity threshold | RGB distance that still counts as "the same colour" (default 24) |
 
-Colour comparisons are **RGBA**: alpha is part of the colour, and fully
-transparent counts as a colour of its own. So a semi-transparent speck inside
-opaque artwork is noise (different alpha even with identical RGB), and a lone
-pixel floating in the transparent background is noise too — its neighbours all
-agree on "transparent", so it is erased. Ordinary silhouette edges stay safe
-because their neighbourhood mixes artwork and transparency and therefore never
-reaches unanimity.
+What it does, per pixel class:
 
-**Semi-transparent pixels (0 < alpha < 100%) are always treated as speckle.**
-With a unanimous neighbourhood they take the surrounding colour. On a mixed
-neighbourhood — the classic case being anti-aliasing residue on the artwork
-edge, half outline black and half pure transparent — they resolve to the
-dominant side: transparent when transparent neighbours are at least as many as
-opaque ones (ties included), otherwise the most common opaque neighbour colour.
-Fully opaque pixels on mixed boundaries are artwork and stay untouched.
+- **Opaque pixel** (α = 100%):
+  - *Unanimous neighbourhood* in one other colour → recoloured to it;
+  - *Blend of two neighbouring colours* (grey anti-aliasing between a black
+    outline and a light fill) → snapped to whichever anchor it lies closer to,
+    hard-edging the boundary. Anti-aliasing bands several pixels deep are
+    handled by repeating the scan (bounded) until stable;
+  - anything else (2-px specks, colour boundaries, corners) → untouched.
+- **Semi-transparent pixel** (0 < α < 100%):
+  - neighbourhood at least as transparent as not → **erased** (the classic
+    edge-residue case: half outline black, half transparent);
+  - unanimous surrounding colour → recoloured to it, **own alpha kept**;
+  - otherwise → untouched (soft shadows keep their alpha).
+- **Transparent pixel** (α = 0): never a repair target.
 
-Consequence: intentional semi-transparent art (soft shadows, alpha gradients)
-gets normalised — outer semi pixels are resolved inward/outward and the region
-slowly becomes hard-edged. This command assumes pixel art with hard alpha.
-
-How the decision works: a pixel is noise when **every** neighbour agrees with
-one representative colour (within the threshold) *and* the pixel itself does not
-match that colour. Requiring unanimity is what separates real specks from
-structure:
-
-Additionally, an **opaque pixel whose colour is a blend of two neighbouring
-colours** — grey anti-aliasing sitting between a black outline and a light fill —
-is snapped to whichever anchor it lies closer to, which hard-edges the boundary
-on the artwork's own terms. Blend detection runs in RGBA, so anchors of a
-different opacity never match. Anti-aliasing bands are often several pixels
-deep, so the scan repeats (up to 16 passes) until the image is stable; deep
-shading bands are safe because their pixels never touch both side colours at
-once. The trade-off: a deliberate 1-px mid-tone line between two flat colours
-will also be resolved to one side.
-
-- a 2-px speck has a dissenting neighbour, so *Single pixel* leaves it alone
-  (switch to *Two pixels* to clean it);
-- a pixel on the boundary between two colours never has unanimous surroundings,
-  so edges are safe;
-- a 3-px or larger blob is never "isolated" and is never touched;
-- a pixel whose colour is already within the threshold (alpha included) is
-  left as it is.
-
-Pixels with fewer than 5 in-bounds neighbours (canvas corners) are skipped —
-too little context to judge safely. Floating specks and 1-2 px floating pairs
-are erased to fully transparent.
+The trade-off: a deliberate 1-px mid-tone line between two flat colours looks
+exactly like anti-aliasing residue and will be resolved to one side.
 
 ## License
 

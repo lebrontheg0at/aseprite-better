@@ -438,12 +438,15 @@ function flatten_colors(opts)
     return r * 65536 + g * 256 + b
   end
 
+  local working = {}
   app.transaction(function()
     -- pass 1: clear semi-transparent pixels, collect the color histogram
     for _, frame in ipairs(frames) do
       local cel = layer:cel(frame)
       if cel then
-        local img = cel.image
+        -- work on a clone; assigning it back is what makes this undoable
+        local img = cel.image:clone()
+        working[frame] = img
         for y = 0, img.height - 1 do
           for x = 0, img.width - 1 do
             local v = img:getPixel(x, y)
@@ -519,9 +522,8 @@ function flatten_colors(opts)
 
     -- pass 2: remap every opaque pixel to its cluster center
     for _, frame in ipairs(frames) do
-      local cel = layer:cel(frame)
-      if cel then
-        local img = cel.image
+      local img = working[frame]
+      if img then
         for y = 0, img.height - 1 do
           for x = 0, img.width - 1 do
             local v = img:getPixel(x, y)
@@ -534,6 +536,14 @@ function flatten_colors(opts)
             end
           end
         end
+      end
+    end
+
+    -- write the reworked frames back; the assignment is the undoable step
+    for frame_num, img in pairs(working) do
+      local cel = layer:cel(frame_num)
+      if cel then
+        cel.image = img
       end
     end
   end)
@@ -1379,13 +1389,11 @@ end
 
 -- Detects a boundary transition pixel: an opaque pixel whose colour is a
 -- blend of two of its neighbours (e.g. grey anti-aliasing sitting between a
--- black outline and a light fill). `c` must differ from both anchors, and lie
--- within the tolerance of the segment between them (t in [0, 1]); the
--- differs-from-both-anchors checks rule out trivial anchor matches.
--- Because the projection runs in RGBA, anchors with a different alpha can
--- never match (a semi or transparent anchor would force t outside the range),
--- so the rule only fires between same-opacity colours. Returns the two anchor
--- colours, or nil.
+-- black outline and a light fill). Both anchors must be fully opaque (an
+-- anchor of any other opacity could otherwise pull the replacement's alpha
+-- around), `c` must differ from both, and lie within the tolerance of the
+-- segment between them (t in [0, 1]; the differs-from-both-anchors checks
+-- rule out trivial anchor matches). Returns the two anchor colours, or nil.
 local function find_transition(c, neigh, tol2)
   local uniq = {}
   for _, v in ipairs(neigh) do
@@ -1403,17 +1411,14 @@ local function find_transition(c, neigh, tol2)
   for i = 1, #uniq do
     for j = i + 1, #uniq do
       local u, v = uniq[i], uniq[j]
-      if differs_from(c, u, tol2) and differs_from(c, v, tol2) then
+      if pc.rgbaA(u) == 255 and pc.rgbaA(v) == 255
+        and differs_from(c, u, tol2) and differs_from(c, v, tol2) then
         local ur, ug, ub = pc.rgbaR(u), pc.rgbaG(u), pc.rgbaB(u)
         local vr, vg, vb = pc.rgbaR(v), pc.rgbaG(v), pc.rgbaB(v)
         local ar, ag, ab = vr - ur, vg - ug, vb - ub
         local ab2 = ar * ar + ag * ag + ab * ab
         if ab2 > 0 then
           local t = ((cr - ur) * ar + (cg - ug) * ag + (cb - ub) * ab) / ab2
-          -- t in [0, 1]: the pixel must project onto the segment itself. The
-          -- differs-from-both-anchors checks above already rule out trivial
-          -- anchor matches, so no narrower band is needed - AA blends at any
-          -- mixing ratio (t = 0.2 or t = 0.9) are equally legitimate.
           if t >= 0 and t <= 1 then
             local pr, pg, pb = ur + ar * t, ug + ag * t, ub + ab * t
             local dr, dg, db = cr - pr, cg - pg, cb - pb
@@ -1428,34 +1433,24 @@ local function find_transition(c, neigh, tol2)
   return nil
 end
 
--- Removes speckle noise: a pixel (or a 2-pixel pair, in "double" mode) whose
--- colour stands out while its surroundings agree with each other is replaced
--- by the surrounding colour. Only isolated pixels are touched - unlike
--- Flatten Colors, which quantises the whole image.
+-- Removes speckle noise. Only the colours of EXISTING pixels are replaced -
+-- this command never fills transparent pixels and never increases any pixel's
+-- opacity, so it cannot generate artwork out of thin air. It can only:
+--   * recolour an opaque pixel (unanimous neighbourhood, or a boundary blend
+--     snapped to the nearer anchor colour),
+--   * recolour a semi-transparent pixel while keeping its alpha,
+--   * erase a pixel (alpha -> 0): floating specks, and semi-transparent
+--     pixels whose neighbourhood is at least as transparent as not
+--     (anti-aliasing residue on the artwork edge).
 --
--- Colour comparisons include alpha, and fully transparent counts as a colour:
--- a semi-transparent speck inside opaque artwork is noise (different alpha),
--- and a lone pixel floating in the transparent background is noise too (its
--- neighbours all agree on "transparent"), so both get cleaned up.
+-- Colour comparisons include alpha; transparent counts as a colour for the
+-- NEIGHBOURHOOD vote, but an empty pixel is never a repair target.
 --
--- Semi-transparent pixels (0 < alpha < 255) are noise outright, with no
--- neighbourhood conditions: they resolve to their surroundings even at canvas
--- corners with a couple of neighbours. Unanimous neighbourhood -> its colour;
--- mixed (e.g. half outline black, half transparent - anti-aliasing residue
--- on the artwork edge) -> the dominant side, ties going to transparent.
---
--- Fully opaque pixels get two rules: the unanimity rule, and the transition
--- rule - an opaque pixel whose colour is a blend of two neighbouring colours
--- (import anti-aliasing between outline and fill) is snapped to whichever
--- anchor colour it lies closer to. Blend detection runs in RGBA, so anchors
--- of a different opacity never match; deep shading bands are safe because
--- their pixels never touch both side colours at once. The trade-off: a
--- deliberate 1-px mid-tone line between two flat colours will also be
--- resolved to one side.
---
--- Anti-aliasing bands are often several pixels deep: the first pass resolves
--- the outer layer and exposes the next one, so the scan repeats (bounded)
--- until the image is stable.
+-- The two pixel classes are handled in separate passes:
+--   * the SEMI pass runs ONCE - iterating it would eat semi regions (soft
+--     shadows) from their corners inward;
+--   * the OPAQUE pass iterates (bounded), because anti-aliasing bands are
+--     often several pixels deep and each pass exposes the layer beneath.
 --
 -- opts fields:
 --   layer      Layer (defaults to the active layer)
@@ -1483,78 +1478,110 @@ function denoise(opts)
         local img = cel.image
         local w, h = img.width, img.height
 
-        -- every in-bounds pixel is a colour, transparent included; only
-        -- out-of-bounds has no data
+        -- work on a clone; assigning it back to the cel at the end is what
+        -- makes the whole operation a single undoable step
+        local work = img:clone()
+
+        -- every in-bounds pixel is a colour for the neighbourhood vote
+        -- (transparent included); only out-of-bounds has no data
         local function getc(x, y)
           if x < 0 or x >= w or y < 0 or y >= h then return nil end
-          return img:getPixel(x, y)
+          return work:getPixel(x, y)
         end
 
-        local function scan_pass()
-          local applied = 0
+        -- collect the 8-neighbourhood colours of one pixel
+        local function neighbours(x, y)
+          local neigh = {}
+          for dy = -1, 1 do
+            for dx = -1, 1 do
+              if dx ~= 0 or dy ~= 0 then
+                local v = getc(x + dx, y + dy)
+                if v then neigh[#neigh + 1] = v end
+              end
+            end
+          end
+          return neigh
+        end
 
-          -- pass 1: single pixels
+        -- SEMI pass: runs once. A semi pixel is erased when its
+        -- neighbourhood is at least as transparent as not (this covers
+        -- floating specks and anti-aliasing residue on the artwork edge),
+        -- recoloured (own alpha kept) when the neighbourhood is unanimous,
+        -- and left alone otherwise (protects soft shadows).
+        local function scan_semi_pass()
+          local applied = 0
           local changes = {}
           for y = 0, h - 1 do
             for x = 0, w - 1 do
               local c = getc(x, y)
-              if c then
-                local a = pc.rgbaA(c)
-                local neigh = {}
-                for dy = -1, 1 do
-                  for dx = -1, 1 do
-                    if dx ~= 0 or dy ~= 0 then
-                      local v = getc(x + dx, y + dy)
-                      if v then neigh[#neigh + 1] = v end
+              local a = pc.rgbaA(c)
+              if a > 0 and a < 255 then
+                local neigh = neighbours(x, y)
+                if #neigh == 0 then
+                  changes[#changes + 1] = { x = x, y = y, c = pc.rgba(0, 0, 0, 0) }
+                else
+                  local rep, count = dominant_color(neigh, tol2)
+                  if rep and count == #neigh then
+                    -- unanimous: erase into a transparent surrounding, or
+                    -- recolour to the surrounding RGB at this pixel's own
+                    -- alpha (never more opaque than it already is)
+                    if pc.rgbaA(rep) == 0 then
+                      changes[#changes + 1] = { x = x, y = y, c = pc.rgba(0, 0, 0, 0) }
+                    else
+                      local dr = pc.rgbaR(c) - pc.rgbaR(rep)
+                      local dg = pc.rgbaG(c) - pc.rgbaG(rep)
+                      local db = pc.rgbaB(c) - pc.rgbaB(rep)
+                      if dr * dr + dg * dg + db * db > tol2 then
+                        changes[#changes + 1] = {
+                          x = x, y = y,
+                          c = pc.rgba(pc.rgbaR(rep), pc.rgbaG(rep), pc.rgbaB(rep), a),
+                        }
+                      end
+                    end
+                  else
+                    local t_count, o_count = 0, 0
+                    for _, v in ipairs(neigh) do
+                      if pc.rgbaA(v) == 0 then
+                        t_count = t_count + 1
+                      else
+                        o_count = o_count + 1
+                      end
+                    end
+                    if t_count >= o_count then
+                      changes[#changes + 1] = { x = x, y = y, c = pc.rgba(0, 0, 0, 0) }
                     end
                   end
                 end
+              end
+            end
+          end
+          for _, ch in ipairs(changes) do
+            work:putPixel(ch.x, ch.y, ch.c)
+            applied = applied + 1
+          end
+          return applied
+        end
 
-                if a > 0 and a < 255 then
-                  -- semi-transparent: noise outright. Unanimous neighbourhood
-                  -- -> its colour; mixed -> the dominant side, a tie going to
-                  -- transparent. No minimum neighbour count.
-                  if #neigh == 0 then
-                    changes[#changes + 1] = { x = x, y = y, c = pc.rgba(0, 0, 0, 0) }
-                  else
-                    local rep, count = dominant_color(neigh, tol2)
-                    if rep and count == #neigh then
-                      if differs_from(c, rep, tol2) then
-                        changes[#changes + 1] = { x = x, y = y, c = rep }
-                      end
-                    else
-                      local t_count, o_list = 0, {}
-                      for _, v in ipairs(neigh) do
-                        if pc.rgbaA(v) == 0 then
-                          t_count = t_count + 1
-                        else
-                          o_list[#o_list + 1] = v
-                        end
-                      end
-                      if t_count >= #o_list then
-                        changes[#changes + 1] = { x = x, y = y, c = pc.rgba(0, 0, 0, 0) }
-                      else
-                        local orep = dominant_color(o_list, tol2)
-                        if orep and differs_from(c, orep, tol2) then
-                          changes[#changes + 1] = { x = x, y = y, c = orep }
-                        end
-                      end
-                    end
-                  end
-                elseif #neigh >= 5 then
-                  -- opaque: "isolated" means the whole neighbourhood agrees;
-                  -- with even one dissenting neighbour this is a 2-px speck or
-                  -- an edge pixel on a colour boundary - unless it is a
-                  -- transition pixel (below)
+        -- OPAQUE pass: unanimity rule and boundary-blend rule. Iterated -
+        -- deep anti-aliasing bands expose one layer per pass. Empty pixels
+        -- are never repair targets, so this can never fill anything.
+        local function scan_opaque_pass()
+          local applied = 0
+          local changes = {}
+          for y = 0, h - 1 do
+            for x = 0, w - 1 do
+              local c = getc(x, y)
+              if pc.rgbaA(c) == 255 then
+                local neigh = neighbours(x, y)
+                if #neigh >= 5 then
                   local rep, count = dominant_color(neigh, tol2)
                   if rep and count == #neigh and differs_from(c, rep, tol2) then
                     changes[#changes + 1] = { x = x, y = y, c = rep }
                   else
                     -- boundary transition pixel: an opaque blend of two
-                    -- neighbouring colours (import anti-aliasing between
-                    -- outline and fill). Snap it to whichever anchor it lies
-                    -- closer to, so the boundary becomes hard-edged on the
-                    -- artwork's own terms.
+                    -- opaque neighbouring colours (import anti-aliasing
+                    -- between outline and fill). Snap it to whichever anchor
+                    -- it lies closer to.
                     local tu, tv = find_transition(c, neigh, tol2)
                     if tu then
                       local du = rgba_dist2(c, tu)
@@ -1579,66 +1606,91 @@ function denoise(opts)
             end
           end
           for _, ch in ipairs(changes) do
-            img:putPixel(ch.x, ch.y, ch.c)
+            work:putPixel(ch.x, ch.y, ch.c)
             applied = applied + 1
           end
-
-          -- pass 2: two-pixel specks (1x2 or 2x1), run on the updated image
-          if double then
-            local changes2 = {}
-            local function check_pair(x1, y1, x2, y2)
-              local pa = getc(x1, y1)
-              local pb = getc(x2, y2)
-              if not (pa and pb) then return end
-              local seen, list = {}, {}
-              local function add(nx, ny)
-                if (nx == x1 and ny == y1) or (nx == x2 and ny == y2) then return end
-                local v = getc(nx, ny)
-                if v then
-                  local key = ny * w + nx
-                  if not seen[key] then
-                    seen[key] = true
-                    list[#list + 1] = v
-                  end
-                end
-              end
-              for _, p in ipairs({ { x1, y1 }, { x2, y2 } }) do
-                for dy = -1, 1 do
-                  for dx = -1, 1 do
-                    if dx ~= 0 or dy ~= 0 then add(p[1] + dx, p[2] + dy) end
-                  end
-                end
-              end
-              if #list >= 6 then
-                local rep, count = dominant_color(list, tol2)
-                -- surroundings of the pair must be unanimous as well
-                if rep and count == #list
-                  and differs_from(pa, rep, tol2) and differs_from(pb, rep, tol2) then
-                  changes2[#changes2 + 1] = { x = x1, y = y1, c = rep }
-                  changes2[#changes2 + 1] = { x = x2, y = y2, c = rep }
-                end
-              end
-            end
-            for y = 0, h - 1 do
-              for x = 0, w - 1 do
-                if x + 1 < w then check_pair(x, y, x + 1, y) end
-                if y + 1 < h then check_pair(x, y, x, y + 1) end
-              end
-            end
-            for _, ch in ipairs(changes2) do
-              img:putPixel(ch.x, ch.y, ch.c)
-              applied = applied + 1
-            end
-          end
-
           return applied
         end
 
-        -- iterate: each pass can expose the layer of residue beneath it
+        -- pair pass: two-pixel specks (1x2 or 2x1) with a unanimous
+        -- surrounding. Both pixels must exist (alpha > 0) - empty pixels are
+        -- never filled. The pair is erased into a transparent surrounding,
+        -- else recoloured with each pixel's own alpha kept.
+        local function scan_pair_pass()
+          local applied = 0
+          local changes2 = {}
+          local function check_pair(x1, y1, x2, y2)
+            local pa = getc(x1, y1)
+            local pb = getc(x2, y2)
+            if not (pa and pb) then return end
+            if pc.rgbaA(pa) == 0 or pc.rgbaA(pb) == 0 then return end
+            local seen, list = {}, {}
+            local function add(nx, ny)
+              if (nx == x1 and ny == y1) or (nx == x2 and ny == y2) then return end
+              local v = getc(nx, ny)
+              if v then
+                local key = ny * w + nx
+                if not seen[key] then
+                  seen[key] = true
+                  list[#list + 1] = v
+                end
+              end
+            end
+            for _, p in ipairs({ { x1, y1 }, { x2, y2 } }) do
+              for dy = -1, 1 do
+                for dx = -1, 1 do
+                  if dx ~= 0 or dy ~= 0 then add(p[1] + dx, p[2] + dy) end
+                end
+              end
+            end
+            if #list >= 6 then
+              local rep, count = dominant_color(list, tol2)
+              -- surroundings of the pair must be unanimous as well
+              if rep and count == #list
+                and differs_from(pa, rep, tol2) and differs_from(pb, rep, tol2) then
+                for _, p in ipairs({ { x1, y1, pa }, { x2, y2, pb } }) do
+                  if pc.rgbaA(rep) == 0 then
+                    changes2[#changes2 + 1] = { x = p[1], y = p[2], c = pc.rgba(0, 0, 0, 0) }
+                  else
+                    changes2[#changes2 + 1] = {
+                      x = p[1], y = p[2],
+                      c = pc.rgba(pc.rgbaR(rep), pc.rgbaG(rep), pc.rgbaB(rep), pc.rgbaA(p[3])),
+                    }
+                  end
+                end
+              end
+            end
+          end
+          for y = 0, h - 1 do
+            for x = 0, w - 1 do
+              if x + 1 < w then check_pair(x, y, x + 1, y) end
+              if y + 1 < h then check_pair(x, y, x, y + 1) end
+            end
+          end
+          for _, ch in ipairs(changes2) do
+            work:putPixel(ch.x, ch.y, ch.c)
+            applied = applied + 1
+          end
+          return applied
+        end
+
+        -- semi pass once (no cascade into soft shadows), then the opaque
+        -- passes iterate until stable, then the pair pass once more on the
+        -- settled image
+        local n = scan_semi_pass()
+        replaced = replaced + n
         for _ = 1, 16 do
-          local n = scan_pass()
+          n = scan_opaque_pass()
           replaced = replaced + n
           if n == 0 then break end
+        end
+        if double then
+          n = scan_pair_pass()
+          replaced = replaced + n
+        end
+
+        if replaced > 0 then
+          cel.image = work
         end
       end
     end
@@ -1663,7 +1715,9 @@ function init(plugin)
         app.alert(labels.no_sprite)
         return
       end
-      toggle_bottom_layer()
+      app.transaction(function()
+        toggle_bottom_layer()
+      end)
       app.refresh()
     end,
   }
