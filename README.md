@@ -136,34 +136,37 @@ Removes speckle and import anti-aliasing while touching everything else as
 little as possible. **Hard guarantees:**
 
 - **Never fills transparent pixels** — empty areas stay empty;
-- **Never increases opacity** — a pixel can only lose alpha or keep it, never
-  gain it (soft shadows survive; intentional semi-transparency is preserved
-  except where it is erased, see below);
-- **Fully undoable** — the whole operation is one undo step (`Ctrl+Z`).
+- **Never increases opacity** — a pixel can only lose alpha or keep it (soft
+  shadows survive);
+- **Fully undoable** — the whole operation is one undo step (`Ctrl+Z`);
+- **Detail-safe** — pixels touching three or more different colours are never
+  touched (no more snapped "strange lines" through detailed areas).
 
 | Option | Meaning |
 |---|---|
-| Mode | **Single pixel** — lone pixels only. **Two pixels** — additionally joins 1×2 / 2×1 specks |
+| Max noise size | Largest noise group considered, in px (1–16, default 4). 1 ≈ single pixels, 2 ≈ pairs, 3–4 ≈ small anti-aliasing blocks |
 | Colour similarity threshold | RGB distance that still counts as "the same colour" (default 24) |
 
-What it does, per pixel class:
+How it works: pixels are grouped into **colour-connected components** (adjacent
+pixels within the tolerance belong together), and each component is judged as a
+whole — not pixel by pixel:
 
-- **Opaque pixel** (α = 100%):
-  - *Unanimous neighbourhood* in one other colour → recoloured to it;
-  - *Blend of two neighbouring colours* (grey anti-aliasing between a black
-    outline and a light fill) → snapped to whichever anchor it lies closer to,
-    hard-edging the boundary. Anti-aliasing bands several pixels deep are
-    handled by repeating the scan (bounded) until stable;
-  - anything else (2-px specks, colour boundaries, corners) → untouched.
-- **Semi-transparent pixel** (0 < α < 100%):
-  - neighbourhood at least as transparent as not → **erased** (the classic
-    edge-residue case: half outline black, half transparent);
-  - unanimous surrounding colour → recoloured to it, **own alpha kept**;
-  - otherwise → untouched (soft shadows keep their alpha).
-- **Transparent pixel** (α = 0): never a repair target.
-
-The trade-off: a deliberate 1-px mid-tone line between two flat colours looks
-exactly like anti-aliasing residue and will be resolved to one side.
+- the colours surrounding the component are collected and clustered; components
+  touching **3+ distinct colours** are detail and skipped (that is what keeps
+  intentional structures safe);
+- the component must be small: at most `max_width²` pixels and at most
+  `max_width + 1` px thick;
+- with **one** surrounding colour → the whole component is recoloured to it
+  (isolated pixels, pairs, and small blobs inside flat areas);
+- with **two** surrounding colours → the component's colour must be a **blend**
+  of them (the signature of anti-aliasing residue) and the whole component is
+  resolved to the nearer side, hard-edging the boundary. A deliberate mid-tone
+  line longer than the size limit is protected by the pixel-count cap; a short
+  one will be resolved to one side;
+- a separate **semi-transparent pass** runs first: semi pixels are erased when
+  their neighbourhood is at least as transparent as not, recoloured with their
+  own alpha kept when the neighbourhood is unanimous, and left alone otherwise
+  (soft shadows keep their alpha).
 
 ## License
 

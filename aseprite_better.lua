@@ -92,9 +92,7 @@ local function ui_labels()
       -- denoise command
       de_title = "去噪点",
       de_about = "把孤立的噪点像素替换成周围一致的颜色。只处理孤立像素，不做整体配色。",
-      de_mode = "去噪模式",
-      de_single = "单像素",
-      de_double = "双像素（同时处理单像素）",
+      de_maxw = "噪点最大宽度 (px)",
       de_tol = "颜色接近阈值",
       de_summary = "去噪完成：替换 %d 个像素。",
     }
@@ -167,9 +165,7 @@ local function ui_labels()
     ro_summary = "%d contour(s) redrawn at %d px: %d contour pixels, %d pixels adjusted.",
     de_title = "Denoise",
     de_about = "Replace isolated noise pixels with the surrounding colour. Only isolated pixels are touched; the palette is not quantised.",
-    de_mode = "Mode",
-    de_single = "Single pixel",
-    de_double = "Two pixels (also fixes single pixels)",
+    de_maxw = "Max noise size (px)",
     de_tol = "Colour similarity threshold",
     de_summary = "Denoise done: %d pixel(s) replaced.",
   }
@@ -1364,9 +1360,8 @@ local function rgba_dist2(a, b)
   return dr * dr + dg * dg + db * db + da * da
 end
 
--- Finds the dominant colour among a neighbour colour list: the entry that the
--- most neighbours agree with (within `tol2`). Returns the representative colour
--- and how many neighbours (including itself) belong to that cluster.
+-- Finds the dominant colour among a colour list: the entry that the most
+-- others agree with (within `tol2`).
 local function dominant_color(list, tol2)
   local best, best_count = nil, 0
   for i = 1, #list do
@@ -1383,79 +1378,40 @@ local function dominant_color(list, tol2)
   return best, best_count
 end
 
-local function differs_from(c, ref, tol2)
-  return rgba_dist2(c, ref) > tol2
-end
-
--- Detects a boundary transition pixel: an opaque pixel whose colour is a
--- blend of two of its neighbours (e.g. grey anti-aliasing sitting between a
--- black outline and a light fill). Both anchors must be fully opaque (an
--- anchor of any other opacity could otherwise pull the replacement's alpha
--- around), `c` must differ from both, and lie within the tolerance of the
--- segment between them (t in [0, 1]; the differs-from-both-anchors checks
--- rule out trivial anchor matches). Returns the two anchor colours, or nil.
-local function find_transition(c, neigh, tol2)
-  local uniq = {}
-  for _, v in ipairs(neigh) do
-    local dup = false
-    for _, u in ipairs(uniq) do
-      if rgba_dist2(v, u) <= tol2 then
-        dup = true
-        break
-      end
-    end
-    if not dup then uniq[#uniq + 1] = v end
-  end
-  if #uniq < 2 then return nil end
-  local cr, cg, cb = pc.rgbaR(c), pc.rgbaG(c), pc.rgbaB(c)
-  for i = 1, #uniq do
-    for j = i + 1, #uniq do
-      local u, v = uniq[i], uniq[j]
-      if pc.rgbaA(u) == 255 and pc.rgbaA(v) == 255
-        and differs_from(c, u, tol2) and differs_from(c, v, tol2) then
-        local ur, ug, ub = pc.rgbaR(u), pc.rgbaG(u), pc.rgbaB(u)
-        local vr, vg, vb = pc.rgbaR(v), pc.rgbaG(v), pc.rgbaB(v)
-        local ar, ag, ab = vr - ur, vg - ug, vb - ub
-        local ab2 = ar * ar + ag * ag + ab * ab
-        if ab2 > 0 then
-          local t = ((cr - ur) * ar + (cg - ug) * ag + (cb - ub) * ab) / ab2
-          if t >= 0 and t <= 1 then
-            local pr, pg, pb = ur + ar * t, ug + ag * t, ub + ab * t
-            local dr, dg, db = cr - pr, cg - pg, cb - pb
-            if dr * dr + dg * dg + db * db <= tol2 then
-              return u, v
-            end
-          end
-        end
-      end
-    end
-  end
-  return nil
-end
-
 -- Removes speckle noise. Only the colours of EXISTING pixels are replaced -
 -- this command never fills transparent pixels and never increases any pixel's
--- opacity, so it cannot generate artwork out of thin air. It can only:
---   * recolour an opaque pixel (unanimous neighbourhood, or a boundary blend
---     snapped to the nearer anchor colour),
---   * recolour a semi-transparent pixel while keeping its alpha,
---   * erase a pixel (alpha -> 0): floating specks, and semi-transparent
---     pixels whose neighbourhood is at least as transparent as not
---     (anti-aliasing residue on the artwork edge).
+-- opacity, so it cannot generate artwork out of thin air.
 --
--- Colour comparisons include alpha; transparent counts as a colour for the
--- NEIGHBOURHOOD vote, but an empty pixel is never a repair target.
+-- How it works: pixels are grouped into colour-connected components (adjacent
+-- pixels within the tolerance belong together). Each component is judged as a
+-- whole:
+--   * neighbouring colours are collected from around the component and
+--     clustered; only components with 1 or 2 distinct surrounding colours are
+--     noise candidates - components touching 3+ colours are detail and are
+--     never touched (this is what keeps intentional lines and shading safe);
+--   * the component must be small: pixel count <= max_width^2 and its stroke
+--     half-width <= max_width. An isolated pixel, a 1x2/2x1 pair, a 2x2 or
+--     3x3 blob of the wrong colour inside a flat area, and anti-aliasing
+--     blocks between two flats all qualify at the right max_width;
+--   * with two surrounding colours the component's own colour must be a blend
+--     of them (within tolerance) - the signature of anti-aliasing residue;
+--     a deliberate mid-tone line between two flats also matches this and will
+--     be resolved to one side.
+-- Resolution: every pixel of the component takes the colour of the nearer
+-- surrounding side (multi-source BFS from the component's border), with the
+-- pixel's own alpha kept unless the surrounding side is transparent (erase).
+-- Alpha can only decrease or stay - soft shadows survive.
 --
--- The two pixel classes are handled in separate passes:
---   * the SEMI pass runs ONCE - iterating it would eat semi regions (soft
---     shadows) from their corners inward;
---   * the OPAQUE pass iterates (bounded), because anti-aliasing bands are
---     often several pixels deep and each pass exposes the layer beneath.
+-- A separate SEMI pass runs first: semi-transparent pixels (0 < alpha < 255)
+-- are erased when their neighbourhood is at least as transparent as not
+-- (anti-aliasing residue on the artwork edge), recoloured with their own alpha
+-- kept when the neighbourhood is unanimous, and left alone otherwise (protects
+-- soft shadows).
 --
 -- opts fields:
 --   layer      Layer (defaults to the active layer)
 --   tolerance  number 0..255, RGB distance that still counts as "the same colour"
---   mode       "single" | "double"
+--   max_width  number 1..16, largest component considered noise
 --   all_frames boolean
 -- Returns { replaced = n }.
 function denoise(opts)
@@ -1466,7 +1422,7 @@ function denoise(opts)
 
   local tol = math.max(0, math.min(255, math.floor(opts.tolerance or 24)))
   local tol2 = tol * tol
-  local double = (opts.mode == "double")
+  local max_width = math.max(1, math.min(16, math.floor(opts.max_width or 4)))
 
   local frames = frames_to_process(spr, { all_frames = opts.all_frames })
   local replaced = 0
@@ -1482,25 +1438,9 @@ function denoise(opts)
         -- makes the whole operation a single undoable step
         local work = img:clone()
 
-        -- every in-bounds pixel is a colour for the neighbourhood vote
-        -- (transparent included); only out-of-bounds has no data
         local function getc(x, y)
           if x < 0 or x >= w or y < 0 or y >= h then return nil end
           return work:getPixel(x, y)
-        end
-
-        -- collect the 8-neighbourhood colours of one pixel
-        local function neighbours(x, y)
-          local neigh = {}
-          for dy = -1, 1 do
-            for dx = -1, 1 do
-              if dx ~= 0 or dy ~= 0 then
-                local v = getc(x + dx, y + dy)
-                if v then neigh[#neigh + 1] = v end
-              end
-            end
-          end
-          return neigh
         end
 
         -- SEMI pass: runs once. A semi pixel is erased when its
@@ -1516,7 +1456,16 @@ function denoise(opts)
               local c = getc(x, y)
               local a = pc.rgbaA(c)
               if a > 0 and a < 255 then
-                local neigh = neighbours(x, y)
+                local neigh = {}
+                for dy = -1, 1 do
+                  for dx = -1, 1 do
+                    if dx ~= 0 or dy ~= 0 then
+                      local v = getc(x + dx, y + dy)
+                      if v then neigh[#neigh + 1] = v end
+                    end
+                  end
+                end
+
                 if #neigh == 0 then
                   changes[#changes + 1] = { x = x, y = y, c = pc.rgba(0, 0, 0, 0) }
                 else
@@ -1562,132 +1511,280 @@ function denoise(opts)
           return applied
         end
 
-        -- OPAQUE pass: unanimity rule and boundary-blend rule. Iterated -
-        -- deep anti-aliasing bands expose one layer per pass. Empty pixels
-        -- are never repair targets, so this can never fill anything.
-        local function scan_opaque_pass()
+        -- COMPONENT pass: judge colour-connected groups as a whole.
+        local function scan_component_pass()
           local applied = 0
-          local changes = {}
+          local n = w * h
+          local comp_id = {}
+          local comps = {}
+          local cid = 0
+
+          -- build colour-connected components over all visible pixels
           for y = 0, h - 1 do
             for x = 0, w - 1 do
-              local c = getc(x, y)
-              if pc.rgbaA(c) == 255 then
-                local neigh = neighbours(x, y)
-                if #neigh >= 5 then
-                  local rep, count = dominant_color(neigh, tol2)
-                  if rep and count == #neigh and differs_from(c, rep, tol2) then
-                    changes[#changes + 1] = { x = x, y = y, c = rep }
-                  else
-                    -- boundary transition pixel: an opaque blend of two
-                    -- opaque neighbouring colours (import anti-aliasing
-                    -- between outline and fill). Snap it to whichever anchor
-                    -- it lies closer to.
-                    local tu, tv = find_transition(c, neigh, tol2)
-                    if tu then
-                      local du = rgba_dist2(c, tu)
-                      local dv = rgba_dist2(c, tv)
-                      local target
-                      if du < dv then
-                        target = tu
-                      elseif dv < du then
-                        target = tv
-                      else
-                        local cu, cv = 0, 0
-                        for _, v in ipairs(neigh) do
-                          if v == tu then cu = cu + 1 elseif v == tv then cv = cv + 1 end
+              local start = y * w + x + 1
+              if comp_id[start] == nil and pc.rgbaA(work:getPixel(x, y)) > 0 then
+                cid = cid + 1
+                comp_id[start] = cid
+                local pixels = { start }
+                local head = 1
+                while head <= #pixels do
+                  local j = pixels[head]
+                  head = head + 1
+                  local jx = (j - 1) % w
+                  local jy = math.floor((j - 1) / w)
+                  local jc = work:getPixel(jx, jy)
+                  for dy = -1, 1 do
+                    for dx = -1, 1 do
+                      if dx ~= 0 or dy ~= 0 then
+                        local nx, ny = jx + dx, jy + dy
+                        if nx >= 0 and nx < w and ny >= 0 and ny < h then
+                          local k = ny * w + nx + 1
+                          if comp_id[k] == nil then
+                            local vc = work:getPixel(nx, ny)
+                            if pc.rgbaA(vc) > 0 and rgba_dist2(vc, jc) <= tol2 then
+                              comp_id[k] = cid
+                              pixels[#pixels + 1] = k
+                            end
+                          end
                         end
-                        target = (cv > cu) and tv or tu
                       end
-                      changes[#changes + 1] = { x = x, y = y, c = target }
+                    end
+                  end
+                end
+                comps[cid] = { pixels = pixels }
+              end
+            end
+          end
+
+          -- representative colour (most common exact pixel value) per component
+          for _, comp in ipairs(comps) do
+            local counts, best, best_n = {}, nil, 0
+            for _, j in ipairs(comp.pixels) do
+              local v = work:getPixel((j - 1) % w, math.floor((j - 1) / w))
+              if counts[v] then
+                counts[v] = counts[v] + 1
+              else
+                counts[v] = 1
+              end
+              if counts[v] > best_n then
+                best_n = counts[v]
+                best = v
+              end
+            end
+            comp.rep = best
+          end
+
+          -- stroke half-width per component: BFS from every component pixel
+          -- that touches a pixel of a different component (or transparency)
+          for _, comp in ipairs(comps) do
+            comp.maxd = 0
+          end
+          local dist = {}
+          local queue, qh = {}, 1
+          for ci, comp in ipairs(comps) do
+            for _, j in ipairs(comp.pixels) do
+              local jx = (j - 1) % w
+              local jy = math.floor((j - 1) / w)
+              local edge = false
+              for dy = -1, 1 do
+                for dx = -1, 1 do
+                  if not edge then
+                    local nx, ny = jx + dx, jy + dy
+                    if nx < 0 or nx >= w or ny < 0 or ny >= h then
+                      edge = true
+                    else
+                      local k = ny * w + nx + 1
+                      if comp_id[k] ~= ci then edge = true end
+                    end
+                  end
+                end
+              end
+              if edge then
+                dist[j] = 1
+                if comp.maxd < 1 then comp.maxd = 1 end
+                queue[#queue + 1] = j
+              end
+            end
+          end
+          while qh <= #queue do
+            local j = queue[qh]
+            qh = qh + 1
+            local jx = (j - 1) % w
+            local jy = math.floor((j - 1) / w)
+            local ci = comp_id[j]
+            local nd = dist[j] + 1
+            for dy = -1, 1 do
+              for dx = -1, 1 do
+                if dx ~= 0 or dy ~= 0 then
+                  local nx, ny = jx + dx, jy + dy
+                  if nx >= 0 and nx < w and ny >= 0 and ny < h then
+                    local k = ny * w + nx + 1
+                    if comp_id[k] == ci and dist[k] == nil then
+                      dist[k] = nd
+                      if comps[ci].maxd < nd then comps[ci].maxd = nd end
+                      queue[#queue + 1] = k
                     end
                   end
                 end
               end
             end
           end
-          for _, ch in ipairs(changes) do
-            work:putPixel(ch.x, ch.y, ch.c)
-            applied = applied + 1
-          end
-          return applied
-        end
 
-        -- pair pass: two-pixel specks (1x2 or 2x1) with a unanimous
-        -- surrounding. Both pixels must exist (alpha > 0) - empty pixels are
-        -- never filled. The pair is erased into a transparent surrounding,
-        -- else recoloured with each pixel's own alpha kept.
-        local function scan_pair_pass()
-          local applied = 0
-          local changes2 = {}
-          local function check_pair(x1, y1, x2, y2)
-            local pa = getc(x1, y1)
-            local pb = getc(x2, y2)
-            if not (pa and pb) then return end
-            if pc.rgbaA(pa) == 0 or pc.rgbaA(pb) == 0 then return end
-            local seen, list = {}, {}
-            local function add(nx, ny)
-              if (nx == x1 and ny == y1) or (nx == x2 and ny == y2) then return end
-              local v = getc(nx, ny)
-              if v then
-                local key = ny * w + nx
-                if not seen[key] then
-                  seen[key] = true
-                  list[#list + 1] = v
-                end
-              end
-            end
-            for _, p in ipairs({ { x1, y1 }, { x2, y2 } }) do
+          -- surrounding colours: for each component, the colours of pixels
+          -- just outside it (transparency included)
+          local flanks = {}
+          for ci, comp in ipairs(comps) do
+            local list = {}
+            for _, j in ipairs(comp.pixels) do
+              local jx = (j - 1) % w
+              local jy = math.floor((j - 1) / w)
               for dy = -1, 1 do
                 for dx = -1, 1 do
-                  if dx ~= 0 or dy ~= 0 then add(p[1] + dx, p[2] + dy) end
+                  if dx ~= 0 or dy ~= 0 then
+                    local nx, ny = jx + dx, jy + dy
+                    if nx >= 0 and nx < w and ny >= 0 and ny < h then
+                      local k = ny * w + nx + 1
+                      if comp_id[k] ~= ci then
+                        list[#list + 1] = work:getPixel(nx, ny)
+                      end
+                    end
+                  end
                 end
               end
             end
-            if #list >= 6 then
-              local rep, count = dominant_color(list, tol2)
-              -- surroundings of the pair must be unanimous as well
-              if rep and count == #list
-                and differs_from(pa, rep, tol2) and differs_from(pb, rep, tol2) then
-                for _, p in ipairs({ { x1, y1, pa }, { x2, y2, pb } }) do
-                  if pc.rgbaA(rep) == 0 then
-                    changes2[#changes2 + 1] = { x = p[1], y = p[2], c = pc.rgba(0, 0, 0, 0) }
+            -- dedupe within tolerance
+            local uniq = {}
+            for _, v in ipairs(list) do
+              local dup = false
+              for _, u in ipairs(uniq) do
+                if rgba_dist2(v, u) <= tol2 then
+                  dup = true
+                  break
+                end
+              end
+              if not dup then uniq[#uniq + 1] = v end
+            end
+            flanks[ci] = uniq
+          end
+
+          -- decide per component, then resolve via multi-source BFS
+          for ci, comp in ipairs(comps) do
+            local fl = flanks[ci]
+            if #fl >= 1 and #fl <= 2 and #comp.pixels <= max_width * max_width
+              and comp.maxd * 2 <= max_width + 1 then
+              local f1 = fl[1]
+              local f2 = fl[2]
+              if #fl == 2 then
+                -- two surrounding colours: the component must be a blend of
+                -- them (anti-aliasing signature) and they must genuinely differ
+                if rgba_dist2(f1, f2) <= tol2 then
+                  -- same colour twice: treat as one flank
+                  f2 = nil
+                else
+                  local f1r, f1g, f1b, f1a = pc.rgbaR(f1), pc.rgbaG(f1), pc.rgbaB(f1), pc.rgbaA(f1)
+                  local f2r, f2g, f2b, f2a = pc.rgbaR(f2), pc.rgbaG(f2), pc.rgbaB(f2), pc.rgbaA(f2)
+                  local rr, rg, rb, ra = pc.rgbaR(comp.rep), pc.rgbaG(comp.rep), pc.rgbaB(comp.rep), pc.rgbaA(comp.rep)
+                  local s1, s2, s3, s4 = f2r - f1r, f2g - f1g, f2b - f1b, f2a - f1a
+                  local seg2 = s1 * s1 + s2 * s2 + s3 * s3 + s4 * s4
+                  if seg2 == 0 then
+                    f2 = nil
                   else
-                    changes2[#changes2 + 1] = {
-                      x = p[1], y = p[2],
-                      c = pc.rgba(pc.rgbaR(rep), pc.rgbaG(rep), pc.rgbaB(rep), pc.rgbaA(p[3])),
-                    }
+                    local t = ((rr - f1r) * s1 + (rg - f1g) * s2 + (rb - f1b) * s3 + (ra - f1a) * s4) / seg2
+                    local pr = f1r + s1 * t
+                    local pg = f1g + s2 * t
+                    local pb = f1b + s3 * t
+                    local pa = f1a + s4 * t
+                    local d = (rr - pr) ^ 2 + (rg - pg) ^ 2 + (rb - pb) ^ 2 + (ra - pa) ^ 2
+                    if t < 0 or t > 1 or d > tol2 then
+                      -- not a blend: intentional detail, leave it alone
+                      f1, f2 = nil, nil
+                    end
+                  end
+                end
+              end
+              if f1 then
+                -- multi-source BFS inside the component from its border,
+                -- carrying the nearer flank colour
+                local distC, pay = {}, {}
+                local queue, qh = {}, 1
+                for _, j in ipairs(comp.pixels) do
+                  local jx = (j - 1) % w
+                  local jy = math.floor((j - 1) / w)
+                  for dy = -1, 1 do
+                    for dx = -1, 1 do
+                      local nx, ny = jx + dx, jy + dy
+                      if nx >= 0 and nx < w and ny >= 0 and ny < h then
+                        local k = ny * w + nx + 1
+                        if comp_id[k] ~= ci then
+                          local nc = work:getPixel(nx, ny)
+                          -- match the flank this border pixel actually touches
+                          local flank
+                          if rgba_dist2(nc, f1) <= tol2 then
+                            flank = f1
+                          elseif f2 and rgba_dist2(nc, f2) <= tol2 then
+                            flank = f2
+                          end
+                          if flank and distC[j] == nil then
+                            distC[j] = 1
+                            pay[j] = flank
+                            queue[#queue + 1] = j
+                          end
+                        end
+                      end
+                    end
+                  end
+                end
+                while qh <= #queue do
+                  local j = queue[qh]
+                  qh = qh + 1
+                  local jx = (j - 1) % w
+                  local jy = math.floor((j - 1) / w)
+                  local nd = distC[j] + 1
+                  for dy = -1, 1 do
+                    for dx = -1, 1 do
+                      if dx ~= 0 or dy ~= 0 then
+                        local nx, ny = jx + dx, jy + dy
+                        if nx >= 0 and nx < w and ny >= 0 and ny < h then
+                          local k = ny * w + nx + 1
+                          if comp_id[k] == ci and distC[k] == nil then
+                            distC[k] = nd
+                            pay[k] = pay[j]
+                            queue[#queue + 1] = k
+                          end
+                        end
+                      end
+                    end
+                  end
+                end
+                for _, j in ipairs(comp.pixels) do
+                  local col = pay[j]
+                  if col then
+                    local jx = (j - 1) % w
+                    local jy = math.floor((j - 1) / w)
+                    local own = work:getPixel(jx, jy)
+                    local na = pc.rgbaA(own)
+                    local fa = pc.rgbaA(col)
+                    local final_a = na
+                    if fa < na then final_a = fa end
+                    work:putPixel(jx, jy,
+                      pc.rgba(pc.rgbaR(col), pc.rgbaG(col), pc.rgbaB(col), final_a))
+                    applied = applied + 1
                   end
                 end
               end
             end
           end
-          for y = 0, h - 1 do
-            for x = 0, w - 1 do
-              if x + 1 < w then check_pair(x, y, x + 1, y) end
-              if y + 1 < h then check_pair(x, y, x, y + 1) end
-            end
-          end
-          for _, ch in ipairs(changes2) do
-            work:putPixel(ch.x, ch.y, ch.c)
-            applied = applied + 1
-          end
+
           return applied
         end
 
-        -- semi pass once (no cascade into soft shadows), then the opaque
-        -- passes iterate until stable, then the pair pass once more on the
-        -- settled image
+        -- semi pass once (no cascade into soft shadows), then the component
+        -- pass judges every colour-connected group as a whole
         local n = scan_semi_pass()
         replaced = replaced + n
-        for _ = 1, 16 do
-          n = scan_opaque_pass()
-          replaced = replaced + n
-          if n == 0 then break end
-        end
-        if double then
-          n = scan_pair_pass()
-          replaced = replaced + n
-        end
+        n = scan_component_pass()
+        replaced = replaced + n
 
         if replaced > 0 then
           cel.image = work
@@ -2011,11 +2108,7 @@ function init(plugin)
 
       dlg:label{ label = labels.de_about }
       dlg:separator{}
-      dlg:combobox{
-        id = "mode", label = labels.de_mode,
-        option = labels.de_single,
-        options = { labels.de_single, labels.de_double },
-      }
+      dlg:number{ id = "maxw", label = labels.de_maxw, text = "4", decimals = 0 }
       dlg:number{ id = "tol", label = labels.de_tol, text = "24", decimals = 0 }
       dlg:separator{}
       dlg:combobox{
@@ -2034,7 +2127,7 @@ function init(plugin)
       local res = denoise{
         layer = app.activeLayer,
         tolerance = data.tol,
-        mode = (data.mode == labels.de_double) and "double" or "single",
+        max_width = data.maxw,
         all_frames = (data.scope == labels.scope_frames),
       }
       if res then
