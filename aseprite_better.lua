@@ -1343,6 +1343,17 @@ end
 -- 6. Denoise
 -- ---------------------------------------------------------------------------
 
+-- Squared RGBA distance: alpha is part of the colour. Two pixels with the
+-- same RGB but different opacity are different colours, and fully transparent
+-- counts as a colour of its own.
+local function rgba_dist2(a, b)
+  local dr = pc.rgbaR(a) - pc.rgbaR(b)
+  local dg = pc.rgbaG(a) - pc.rgbaG(b)
+  local db = pc.rgbaB(a) - pc.rgbaB(b)
+  local da = pc.rgbaA(a) - pc.rgbaA(b)
+  return dr * dr + dg * dg + db * db + da * da
+end
+
 -- Finds the dominant colour among a neighbour colour list: the entry that the
 -- most neighbours agree with (within `tol2`). Returns the representative colour
 -- and how many neighbours (including itself) belong to that cluster.
@@ -1350,16 +1361,9 @@ local function dominant_color(list, tol2)
   local best, best_count = nil, 0
   for i = 1, #list do
     local vi = list[i]
-    local ri, gi, bi = pc.rgbaR(vi), pc.rgbaG(vi), pc.rgbaB(vi)
     local cnt = 1
     for j = 1, #list do
-      if j ~= i then
-        local vj = list[j]
-        local dr = pc.rgbaR(vj) - ri
-        local dg = pc.rgbaG(vj) - gi
-        local db = pc.rgbaB(vj) - bi
-        if dr * dr + dg * dg + db * db <= tol2 then cnt = cnt + 1 end
-      end
+      if j ~= i and rgba_dist2(vi, list[j]) <= tol2 then cnt = cnt + 1 end
     end
     if cnt > best_count then
       best_count = cnt
@@ -1370,16 +1374,20 @@ local function dominant_color(list, tol2)
 end
 
 local function differs_from(c, ref, tol2)
-  local dr = pc.rgbaR(c) - pc.rgbaR(ref)
-  local dg = pc.rgbaG(c) - pc.rgbaG(ref)
-  local db = pc.rgbaB(c) - pc.rgbaB(ref)
-  return (dr * dr + dg * dg + db * db) > tol2
+  return rgba_dist2(c, ref) > tol2
 end
 
 -- Removes speckle noise: a pixel (or a 2-pixel pair, in "double" mode) whose
 -- colour stands out while its surroundings agree with each other is replaced
 -- by the surrounding colour. Only isolated pixels are touched — unlike
 -- Flatten Colors, which quantises the whole image.
+--
+-- Colour comparisons include alpha, and fully transparent counts as a colour:
+-- a semi-transparent speck inside opaque artwork is noise (different alpha),
+-- and a lone pixel floating in the transparent background is noise too (its
+-- neighbours all agree on "transparent"), so both get cleaned up. Ordinary
+-- silhouette edges stay safe because their neighbourhood mixes artwork and
+-- transparency and therefore never reaches unanimity.
 --
 -- opts fields:
 --   layer      Layer (defaults to the active layer)
@@ -1407,11 +1415,11 @@ function denoise(opts)
         local img = cel.image
         local w, h = img.width, img.height
 
+        -- every in-bounds pixel is a colour, transparent included; only
+        -- out-of-bounds has no data
         local function getc(x, y)
           if x < 0 or x >= w or y < 0 or y >= h then return nil end
-          local v = img:getPixel(x, y)
-          if pc.rgbaA(v) == 0 then return nil end
-          return v
+          return img:getPixel(x, y)
         end
 
         -- pass 1: isolated single pixels

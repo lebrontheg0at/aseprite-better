@@ -141,9 +141,17 @@ belong to their neighbourhood.
 | Mode | **Single pixel** — only a lone pixel whose entire 8-neighbourhood is one colour (and it differs from it) is replaced. **Two pixels** — additionally joins 1×2 / 2×1 specks whose combined surroundings are unanimous |
 | Colour similarity threshold | How far apart two colours may be and still count as the same (RGB distance, default 24) |
 
-How the decision works: a pixel is noise when **every** opaque neighbour agrees
-with one representative colour (within the threshold) *and* the pixel itself does
-not match that colour. Requiring unanimity is what separates real specks from
+Colour comparisons are **RGBA**: alpha is part of the colour, and fully
+transparent counts as a colour of its own. So a semi-transparent speck inside
+opaque artwork is noise (different alpha even with identical RGB), and a lone
+pixel floating in the transparent background is noise too — its neighbours all
+agree on "transparent", so it is erased. Ordinary silhouette edges stay safe
+because their neighbourhood mixes artwork and transparency and therefore never
+reaches unanimity.
+
+How the decision works: a pixel is noise when **every** neighbour agrees with
+one representative colour (within the threshold) *and* the pixel itself does not
+match that colour. Requiring unanimity is what separates real specks from
 structure:
 
 - a 2-px speck has a dissenting neighbour, so *Single pixel* leaves it alone
@@ -151,10 +159,12 @@ structure:
 - a pixel on the boundary between two colours never has unanimous surroundings,
   so edges are safe;
 - a 3-px or larger blob is never "isolated" and is never touched;
-- a pixel whose colour is already within the threshold is left as it is.
+- a pixel whose colour is already within the threshold (alpha included) is
+  left as it is.
 
-Pixels on the silhouette edge (fewer than 5 opaque neighbours) are skipped —
-too little context to judge safely.
+Pixels with fewer than 5 in-bounds neighbours (canvas corners) are skipped —
+too little context to judge safely. Floating specks and 1-2 px floating pairs
+are erased to fully transparent.
 
 ## License
 
