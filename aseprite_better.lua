@@ -89,6 +89,14 @@ local function ui_labels()
       ro_layer_name = "轮廓",
       ro_fail = "没有检测到符合条件的深色轮廓。可尝试调大深色判定阈值或轮廓最大宽度。",
       ro_summary = "已重绘 %d 条轮廓：宽度 %d px，轮廓 %d 像素，修整 %d 像素。",
+      -- denoise command
+      de_title = "去噪点",
+      de_about = "把孤立的噪点像素替换成周围一致的颜色。只处理孤立像素，不做整体配色。",
+      de_mode = "去噪模式",
+      de_single = "单像素",
+      de_double = "双像素（同时处理单像素）",
+      de_tol = "颜色接近阈值",
+      de_summary = "去噪完成：替换 %d 个像素。",
     }
   end
   return {
@@ -157,6 +165,13 @@ local function ui_labels()
     ro_layer_name = "Contour",
     ro_fail = "No dark contour matched. Try raising the dark threshold or the max contour width.",
     ro_summary = "%d contour(s) redrawn at %d px: %d contour pixels, %d pixels adjusted.",
+    de_title = "Denoise",
+    de_about = "Replace isolated noise pixels with the surrounding colour. Only isolated pixels are touched; the palette is not quantised.",
+    de_mode = "Mode",
+    de_single = "Single pixel",
+    de_double = "Two pixels (also fixes single pixels)",
+    de_tol = "Colour similarity threshold",
+    de_summary = "Denoise done: %d pixel(s) replaced.",
   }
 end
 
@@ -1325,6 +1340,170 @@ function redraw_contour(opts)
 end
 
 -- ---------------------------------------------------------------------------
+-- 6. Denoise
+-- ---------------------------------------------------------------------------
+
+-- Finds the dominant colour among a neighbour colour list: the entry that the
+-- most neighbours agree with (within `tol2`). Returns the representative colour
+-- and how many neighbours (including itself) belong to that cluster.
+local function dominant_color(list, tol2)
+  local best, best_count = nil, 0
+  for i = 1, #list do
+    local vi = list[i]
+    local ri, gi, bi = pc.rgbaR(vi), pc.rgbaG(vi), pc.rgbaB(vi)
+    local cnt = 1
+    for j = 1, #list do
+      if j ~= i then
+        local vj = list[j]
+        local dr = pc.rgbaR(vj) - ri
+        local dg = pc.rgbaG(vj) - gi
+        local db = pc.rgbaB(vj) - bi
+        if dr * dr + dg * dg + db * db <= tol2 then cnt = cnt + 1 end
+      end
+    end
+    if cnt > best_count then
+      best_count = cnt
+      best = vi
+    end
+  end
+  return best, best_count
+end
+
+local function differs_from(c, ref, tol2)
+  local dr = pc.rgbaR(c) - pc.rgbaR(ref)
+  local dg = pc.rgbaG(c) - pc.rgbaG(ref)
+  local db = pc.rgbaB(c) - pc.rgbaB(ref)
+  return (dr * dr + dg * dg + db * db) > tol2
+end
+
+-- Removes speckle noise: a pixel (or a 2-pixel pair, in "double" mode) whose
+-- colour stands out while its surroundings agree with each other is replaced
+-- by the surrounding colour. Only isolated pixels are touched — unlike
+-- Flatten Colors, which quantises the whole image.
+--
+-- opts fields:
+--   layer      Layer (defaults to the active layer)
+--   tolerance  number 0..255, RGB distance that still counts as "the same colour"
+--   mode       "single" | "double"
+--   all_frames boolean
+-- Returns { replaced = n }.
+function denoise(opts)
+  local spr = app.activeSprite
+  if not spr then return nil end
+  local layer = opts.layer or app.activeLayer
+  if not layer then return nil end
+
+  local tol = math.max(0, math.min(255, math.floor(opts.tolerance or 24)))
+  local tol2 = tol * tol
+  local double = (opts.mode == "double")
+
+  local frames = frames_to_process(spr, { all_frames = opts.all_frames })
+  local replaced = 0
+
+  app.transaction(function()
+    for _, frame in ipairs(frames) do
+      local cel = layer:cel(frame)
+      if cel then
+        local img = cel.image
+        local w, h = img.width, img.height
+
+        local function getc(x, y)
+          if x < 0 or x >= w or y < 0 or y >= h then return nil end
+          local v = img:getPixel(x, y)
+          if pc.rgbaA(v) == 0 then return nil end
+          return v
+        end
+
+        -- pass 1: isolated single pixels
+        local changes = {}
+        for y = 0, h - 1 do
+          for x = 0, w - 1 do
+            local c = getc(x, y)
+            if c then
+              local neigh = {}
+              for dy = -1, 1 do
+                for dx = -1, 1 do
+                  if dx ~= 0 or dy ~= 0 then
+                    local v = getc(x + dx, y + dy)
+                    if v then neigh[#neigh + 1] = v end
+                  end
+                end
+              end
+              if #neigh >= 5 then
+                local rep, count = dominant_color(neigh, tol2)
+                -- "isolated" means the whole neighbourhood agrees: with even
+                -- one dissenting neighbour this is a 2-px speck or an edge
+                -- pixel on a colour boundary, and single mode must not touch it
+                if rep and count == #neigh and differs_from(c, rep, tol2) then
+                  changes[#changes + 1] = { x = x, y = y, c = rep }
+                end
+              end
+            end
+          end
+        end
+        for _, ch in ipairs(changes) do
+          img:putPixel(ch.x, ch.y, ch.c)
+          replaced = replaced + 1
+        end
+
+        -- pass 2: two-pixel specks (1x2 or 2x1), run on the updated image
+        if double then
+          local changes2 = {}
+          local function check_pair(x1, y1, x2, y2)
+            local a = getc(x1, y1)
+            local b = getc(x2, y2)
+            if not (a and b) then return end
+            -- union of both 8-neighbourhoods, minus the pair itself
+            local seen, list = {}, {}
+            local function add(nx, ny)
+              if (nx == x1 and ny == y1) or (nx == x2 and ny == y2) then return end
+              local v = getc(nx, ny)
+              if v then
+                local key = ny * w + nx
+                if not seen[key] then
+                  seen[key] = true
+                  list[#list + 1] = v
+                end
+              end
+            end
+            for _, p in ipairs({ { x1, y1 }, { x2, y2 } }) do
+              local px, py = p[1], p[2]
+              for dy = -1, 1 do
+                for dx = -1, 1 do
+                  if dx ~= 0 or dy ~= 0 then add(px + dx, py + dy) end
+                end
+              end
+            end
+            if #list >= 6 then
+              local rep, count = dominant_color(list, tol2)
+              -- surroundings of the pair must be unanimous as well
+              if rep and count == #list
+                and differs_from(a, rep, tol2) and differs_from(b, rep, tol2) then
+                changes2[#changes2 + 1] = { x = x1, y = y1, c = rep }
+                changes2[#changes2 + 1] = { x = x2, y = y2, c = rep }
+              end
+            end
+          end
+          for y = 0, h - 1 do
+            for x = 0, w - 1 do
+              if x + 1 < w then check_pair(x, y, x + 1, y) end
+              if y + 1 < h then check_pair(x, y, x, y + 1) end
+            end
+          end
+          for _, ch in ipairs(changes2) do
+            img:putPixel(ch.x, ch.y, ch.c)
+            replaced = replaced + 1
+          end
+        end
+      end
+    end
+  end)
+
+  app.refresh()
+  return { replaced = replaced }
+end
+
+-- ---------------------------------------------------------------------------
 -- Registration
 -- ---------------------------------------------------------------------------
 
@@ -1612,6 +1791,57 @@ function init(plugin)
         return
       end
       app.alert(string.format(labels.ro_summary, res.contours, res.width, res.pixels, res.adjusted))
+    end,
+  }
+  plugin:newCommand{
+    id = "Denoise",
+    title = labels.de_title,
+    group = "edit_fx",
+    onclick = function()
+      local spr = app.activeSprite
+      if not spr then
+        app.alert(labels.no_sprite)
+        return
+      end
+      if not app.activeLayer then
+        app.alert(labels.no_layer)
+        return
+      end
+
+      local dlg = Dialog{ title = labels.de_title }
+      if not dlg then return end
+
+      dlg:label{ label = labels.de_about }
+      dlg:separator{}
+      dlg:combobox{
+        id = "mode", label = labels.de_mode,
+        option = labels.de_single,
+        options = { labels.de_single, labels.de_double },
+      }
+      dlg:number{ id = "tol", label = labels.de_tol, text = "24", decimals = 0 }
+      dlg:separator{}
+      dlg:combobox{
+        id = "scope", label = labels.scope,
+        option = labels.scope_cel,
+        options = { labels.scope_cel, labels.scope_frames },
+      }
+      dlg:separator{}
+      dlg:button{ id = "ok", text = "OK", focus = true }
+      dlg:button{ id = "cancel", text = "Cancel" }
+      dlg:show()
+
+      local data = dlg.data
+      if not data.ok then return end
+
+      local res = denoise{
+        layer = app.activeLayer,
+        tolerance = data.tol,
+        mode = (data.mode == labels.de_double) and "double" or "single",
+        all_frames = (data.scope == labels.scope_frames),
+      }
+      if res then
+        app.alert(string.format(labels.de_summary, res.replaced))
+      end
     end,
   }
 end

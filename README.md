@@ -128,6 +128,34 @@ Notes:
 - Detection is by colour: small dark details under the threshold (pupils, dots)
   are treated as contours as well.
 
+### 6. Denoise
+
+`Edit → FX → Denoise` (`编辑 → FX → 去噪点`).
+
+Replaces isolated speckle pixels with the colour around them. Unlike *Flatten
+Colors*, which quantises the whole image, this only touches pixels that do not
+belong to their neighbourhood.
+
+| Option | Meaning |
+|---|---|
+| Mode | **Single pixel** — only a lone pixel whose entire 8-neighbourhood is one colour (and it differs from it) is replaced. **Two pixels** — additionally joins 1×2 / 2×1 specks whose combined surroundings are unanimous |
+| Colour similarity threshold | How far apart two colours may be and still count as the same (RGB distance, default 24) |
+
+How the decision works: a pixel is noise when **every** opaque neighbour agrees
+with one representative colour (within the threshold) *and* the pixel itself does
+not match that colour. Requiring unanimity is what separates real specks from
+structure:
+
+- a 2-px speck has a dissenting neighbour, so *Single pixel* leaves it alone
+  (switch to *Two pixels* to clean it);
+- a pixel on the boundary between two colours never has unanimous surroundings,
+  so edges are safe;
+- a 3-px or larger blob is never "isolated" and is never touched;
+- a pixel whose colour is already within the threshold is left as it is.
+
+Pixels on the silhouette edge (fewer than 5 opaque neighbours) are skipped —
+too little context to judge safely.
+
 ## License
 
 CC0 — Public Domain.
