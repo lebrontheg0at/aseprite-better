@@ -1511,6 +1511,47 @@ function denoise(opts)
           return applied
         end
 
+        -- EDGE pass: an opaque pixel on the silhouette that has NO
+        -- same-coloured opaque neighbour is anti-aliasing fringe residue
+        -- (it matches nothing around it) - erase it. Solid outline pixels
+        -- and same-coloured 1-px edge details are safe because they match a
+        -- neighbour. Iterated (bounded) so a 2-px halo is cleaned too.
+        local function scan_edge_orphan_pass()
+          local applied = 0
+          local changes = {}
+          for y = 0, h - 1 do
+            for x = 0, w - 1 do
+              local c = getc(x, y)
+              if pc.rgbaA(c) > 0 then
+                local touches_tr = false
+                local nb_count = 0
+                local has_same = false
+                for dy = -1, 1 do
+                  for dx = -1, 1 do
+                    if dx ~= 0 or dy ~= 0 then
+                      local v = getc(x + dx, y + dy)
+                      if v == nil or pc.rgbaA(v) == 0 then
+                        touches_tr = true
+                      else
+                        nb_count = nb_count + 1
+                        if rgba_dist2(v, c) <= tol2 then has_same = true end
+                      end
+                    end
+                  end
+                end
+                if touches_tr and nb_count > 0 and not has_same then
+                  changes[#changes + 1] = { x = x, y = y, c = pc.rgba(0, 0, 0, 0) }
+                end
+              end
+            end
+          end
+          for _, ch in ipairs(changes) do
+            work:putPixel(ch.x, ch.y, ch.c)
+            applied = applied + 1
+          end
+          return applied
+        end
+
         -- COMPONENT pass: judge colour-connected groups as a whole.
         local function scan_component_pass()
           local applied = 0
@@ -1783,6 +1824,11 @@ function denoise(opts)
         -- pass judges every colour-connected group as a whole
         local n = scan_semi_pass()
         replaced = replaced + n
+        for _ = 1, 3 do
+          n = scan_edge_orphan_pass()
+          replaced = replaced + n
+          if n == 0 then break end
+        end
         n = scan_component_pass()
         replaced = replaced + n
 

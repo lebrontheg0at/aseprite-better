@@ -163,6 +163,12 @@ whole — not pixel by pixel:
   resolved to the nearer side, hard-edging the boundary. A deliberate mid-tone
   line longer than the size limit is protected by the pixel-count cap; a short
   one will be resolved to one side;
+- an **edge-orphan pass** erases anti-aliasing fringe pixels on the silhouette:
+  an opaque pixel that touches transparency and has **no same-coloured opaque
+  neighbour** matches nothing around it, so it is residue (the 1-px halo left
+  by flattening art on a white background). Solid outline pixels, same-coloured
+  1-px details and same-coloured rim-light chains are safe because they match a
+  neighbour. Iterated (bounded) so a 2-px halo is cleaned too;
 - a separate **semi-transparent pass** runs first: semi pixels are erased when
   their neighbourhood is at least as transparent as not, recoloured with their
   own alpha kept when the neighbourhood is unanimous, and left alone otherwise
