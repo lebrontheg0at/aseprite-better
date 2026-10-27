@@ -1712,10 +1712,31 @@ function denoise(opts)
           -- decide per component, then resolve via multi-source BFS
           for ci, comp in ipairs(comps) do
             local fl = flanks[ci]
-            if #fl >= 1 and #fl <= 2 and #comp.pixels <= max_width * max_width
-              and comp.maxd * 2 <= max_width + 1 then
-              local f1 = fl[1]
-              local f2 = fl[2]
+            -- judge by THICKNESS only: transition bands along an edge are
+            -- thin but can be very long (a gradient ramp between the outline
+            -- and the fill), so a total-pixel-count cap would miss them.
+            --
+            -- Components touching 3+ surrounding colours are normally
+            -- protected (detail), but a TINY one (<= max_width^2 pixels) is
+            -- a single anti-aliasing step on a gradient staircase - it sits
+            -- between three or four shades. For those, use the most-distant
+            -- pair of surrounding colours (e.g. black and cream) as the two
+            -- sides of the transition.
+            local tiny = #comp.pixels <= max_width * max_width
+            if #fl >= 1 and (#fl <= 2 or tiny) and comp.maxd * 2 <= max_width + 1 then
+              local f1, f2 = fl[1], fl[2]
+              if #fl > 2 then
+                local bd = -1
+                for i = 1, #fl do
+                  for j = i + 1, #fl do
+                    local dd = rgba_dist2(fl[i], fl[j])
+                    if dd > bd then
+                      bd = dd
+                      f1, f2 = fl[i], fl[j]
+                    end
+                  end
+                end
+              end
               if #fl == 2 then
                 -- two surrounding colours: the component must be a blend of
                 -- them (anti-aliasing signature) and they must genuinely differ
@@ -1808,9 +1829,13 @@ function denoise(opts)
                     local fa = pc.rgbaA(col)
                     local final_a = na
                     if fa < na then final_a = fa end
-                    work:putPixel(jx, jy,
-                      pc.rgba(pc.rgbaR(col), pc.rgbaG(col), pc.rgbaB(col), final_a))
-                    applied = applied + 1
+                    local out = pc.rgba(pc.rgbaR(col), pc.rgbaG(col), pc.rgbaB(col), final_a)
+                    -- only real changes count; writing the same colour again
+                    -- would make the iteration never converge
+                    if out ~= own then
+                      work:putPixel(jx, jy, out)
+                      applied = applied + 1
+                    end
                   end
                 end
               end
@@ -1829,8 +1854,14 @@ function denoise(opts)
           replaced = replaced + n
           if n == 0 then break end
         end
-        n = scan_component_pass()
-        replaced = replaced + n
+        -- iterate: a gradient ramp between two flats is a chain of thin
+        -- components, and one pass only moves each layer one step towards
+        -- its neighbours - repeating pushes them out to the two end colours
+        for _ = 1, 6 do
+          n = scan_component_pass()
+          replaced = replaced + n
+          if n == 0 then break end
+        end
 
         if replaced > 0 then
           cel.image = work

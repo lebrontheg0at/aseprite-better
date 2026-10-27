@@ -152,10 +152,15 @@ pixels within the tolerance belong together), and each component is judged as a
 whole — not pixel by pixel:
 
 - the colours surrounding the component are collected and clustered; components
-  touching **3+ distinct colours** are detail and skipped (that is what keeps
-  intentional structures safe);
-- the component must be small: at most `max_width²` pixels and at most
-  `max_width + 1` px thick;
+  touching **3+ distinct colours** are detail and skipped — except a **tiny**
+  one (≤ max_width² pixels): a single anti-aliasing step on a gradient
+  staircase sits between 3–4 shades, so for those the **most-distant pair** of
+  surrounding colours (e.g. black and cream) is used as the two sides of the
+  transition;
+- the component must be **thin**: at most `max_width + 1` px thick. Length is
+  not limited — a long gradient ramp along an edge is exactly what this
+  removes — and the pass repeats (bounded) until the image is stable so the
+  whole ramp collapses onto its two end colours;
 - with **one** surrounding colour → the whole component is recoloured to it
   (isolated pixels, pairs, and small blobs inside flat areas);
 - with **two** surrounding colours → the component's colour must be a **blend**
