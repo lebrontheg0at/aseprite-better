@@ -5,6 +5,22 @@ bundled in one extension.
 
 ![preview](docs/preview.png)
 
+## Selection support
+
+**If a selection exists, every pixel-based command only modifies pixels inside
+it** — everything outside keeps its original value. The artwork outside the
+selection still provides context (shadows, contours and components are computed
+from the whole layer), so no artificial edges appear at the selection border.
+
+| Command | Behaviour with a selection |
+|---|---|
+| Drop Shadow | Only the selected artwork casts a shadow |
+| Flatten Colors | Only selected pixels are counted and remapped |
+| Denoise | Only selected pixels are cleaned |
+| Redraw Contour | Contours are detected on the whole layer, but only the selected part is redrawn; outside pixels are restored untouched |
+| Perfect Pixel | Analyses the selection's bounding box and builds the result from that region |
+| Toggle Bottom Layer | Not pixel-based — ignores the selection |
+
 ## Commands
 
 ### 1. Toggle Visibility of Bottom Layer

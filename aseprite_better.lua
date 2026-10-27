@@ -71,6 +71,7 @@ local function ui_labels()
       pp_scope_layer = "当前图层",
       pp_layer_name = "完美像素",
       pp_fail = "网格检测失败：画面里找不到足够明显的像素边界。请改用「手动指定」格数。",
+      pp_no_sel = "选区内没有像素。",
       pp_bad_size = "检测到的像素格 %.2f × %.2f px 超出合理范围（4～20 px），结果可能不对；可用手动指定。",
       pp_result_layer = "检测到像素格 %.2f × %.2f px，已在原尺寸上还原为 %d × %d 格。",
       pp_result_sprite = "检测到像素格 %.2f × %.2f px，已新建精灵 %d × %d。",
@@ -146,6 +147,7 @@ local function ui_labels()
     pp_scope_layer = "Active layer",
     pp_layer_name = "Perfect Pixel",
     pp_fail = "Grid detection failed: no clear pixel boundaries were found. Use the manual grid size instead.",
+    pp_no_sel = "The selection contains no pixels.",
     pp_bad_size = "Detected pixel size %.2f × %.2f px is outside the plausible range (4-20 px); the result may be wrong - consider the manual grid size.",
     pp_result_layer = "Detected %.2f × %.2f px per cell; restored to %d × %d cells at canvas size.",
     pp_result_sprite = "Detected %.2f × %.2f px per cell; created a new %d × %d sprite.",
@@ -249,7 +251,12 @@ local function build_shadow_image(src, opts)
     for x = 0, w - 1 do
       local v = src:getPixel(x, y)
       local idx = y * w + x + 1
-      alpha[idx] = pc.rgbaA(v)
+      local a = pc.rgbaA(v)
+      -- with a selection, artwork outside it contributes no shadow
+      if opts.inside and not opts.inside(x + (opts.ox or 0), y + (opts.oy or 0)) then
+        a = 0
+      end
+      alpha[idx] = a
       if opts.flat_color then
         colors[idx] = { opts.flat_color.red, opts.flat_color.green, opts.flat_color.blue }
       else
@@ -279,6 +286,19 @@ local function build_shadow_image(src, opts)
     end
   end
   return out
+end
+
+-- Returns a predicate testing whether a sprite-space pixel lies inside the
+-- active selection, or nil when there is no selection (process everything).
+-- Commands use it to restrict their output: the surrounding artwork outside
+-- the selection still provides context (components, silhouettes), but nothing
+-- outside the selection is modified.
+local function selection_filter(spr)
+  local sel = spr.selection
+  if not sel or sel.isEmpty then return nil end
+  return function(x, y)
+    return sel:contains(x, y)
+  end
 end
 
 local function frames_to_process(spr, opts)
@@ -315,6 +335,7 @@ function apply_drop_shadow(opts)
   end
 
   local params = {
+    inside = selection_filter(spr),
     dx = opts.dx or 1,
     dy = opts.dy or 1,
     softness = math.max(0, math.floor(opts.softness or 0)),
@@ -340,6 +361,8 @@ function apply_drop_shadow(opts)
     for _, frame in ipairs(frames_to_process(spr, params)) do
       local cel = layer:cel(frame)
       if cel then
+        params.ox = cel.position.x
+        params.oy = cel.position.y
         local simg = build_shadow_image(cel.image, params)
         local sx = cel.position.x + params.dx
         local sy = cel.position.y + params.dy
@@ -435,6 +458,7 @@ function flatten_colors(opts)
   end
 
   local working = {}
+  local inside = selection_filter(spr)
   app.transaction(function()
     -- pass 1: clear semi-transparent pixels, collect the color histogram
     for _, frame in ipairs(frames) do
@@ -443,11 +467,12 @@ function flatten_colors(opts)
         -- work on a clone; assigning it back is what makes this undoable
         local img = cel.image:clone()
         working[frame] = img
+        local ox, oy = cel.position.x, cel.position.y
         for y = 0, img.height - 1 do
           for x = 0, img.width - 1 do
             local v = img:getPixel(x, y)
             local a = pc.rgbaA(v)
-            if a > 0 then
+            if a > 0 and (inside == nil or inside(ox + x, oy + y)) then
               if a < 255 then
                 if clear_semi then
                   img:putPixel(x, y, pc.rgba(0, 0, 0, 0))
@@ -519,11 +544,13 @@ function flatten_colors(opts)
     -- pass 2: remap every opaque pixel to its cluster center
     for _, frame in ipairs(frames) do
       local img = working[frame]
-      if img then
+      local cel = layer:cel(frame)
+      if img and cel then
+        local ox, oy = cel.position.x, cel.position.y
         for y = 0, img.height - 1 do
           for x = 0, img.width - 1 do
             local v = img:getPixel(x, y)
-            if pc.rgbaA(v) == 255 then
+            if pc.rgbaA(v) == 255 and (inside == nil or inside(ox + x, oy + y)) then
               local r, g, b = pc.rgbaR(v), pc.rgbaG(v), pc.rgbaB(v)
               local c = map[color_key(r, g, b)]
               if c and (c[1] ~= r or c[2] ~= g or c[3] ~= b) then
@@ -863,8 +890,36 @@ function perfect_pixel_restore(opts)
     -- the active cel's own image bounds, so unrelated empty margins are ignored
     local cel = layer:cel(frame)
     if not cel then return nil, "no_cel" end
-    src = { img = cel.image, x = cel.position.x, y = cel.position.y }
-    w, h = cel.image.width, cel.image.height
+    local img = cel.image
+    local ox, oy = cel.position.x, cel.position.y
+    -- with a selection, analyse only its bounding box (grid detection needs
+    -- a contiguous region, so a non-rectangular selection is approximated)
+    local sel = selection_filter(spr)
+    if sel then
+      local minx, miny, maxx, maxy = img.width, img.height, -1, -1
+      for yy = 0, img.height - 1 do
+        for xx = 0, img.width - 1 do
+          if sel(ox + xx, oy + yy) and pc.rgbaA(img:getPixel(xx, yy)) > 0 then
+            if xx < minx then minx = xx end
+            if xx > maxx then maxx = xx end
+            if yy < miny then miny = yy end
+            if yy > maxy then maxy = yy end
+          end
+        end
+      end
+      if maxx < 0 then return nil, "pp_no_sel" end
+      local bw, bh = maxx - minx + 1, maxy - miny + 1
+      local cropped = Image(bw, bh)
+      for yy = 0, bh - 1 do
+        for xx = 0, bw - 1 do
+          cropped:putPixel(xx, yy, img:getPixel(minx + xx, miny + yy))
+        end
+      end
+      img = cropped
+      ox, oy = ox + minx, oy + miny
+    end
+    src = { img = img, x = ox, y = oy }
+    w, h = img.width, img.height
   end
 
   local gray = to_gray(src.img)
@@ -1159,6 +1214,7 @@ function redraw_contour(opts)
   local frames = frames_to_process(spr, { all_frames = opts.all_frames })
   local results = {}
   local total_contours, total_px, total_adj = 0, 0, 0
+  local inside = selection_filter(spr)
 
   for _, frame in ipairs(frames) do
     local cel = layer:cel(frame)
@@ -1273,7 +1329,13 @@ function redraw_contour(opts)
           for x = 1, w do
             local i = y * w + x
             local v
-            if new[i] then
+            -- padded pixel (x,y) maps back to sprite coords
+            local keep_original = inside ~= nil
+              and not inside(cel.position.x - pad + x - 1, cel.position.y - pad + y - 1)
+            if keep_original then
+              -- outside the selection: keep the original pixel untouched
+              v = colors[i]
+            elseif new[i] then
               v = packed
               cnt_new = cnt_new + 1
             elseif removed[i] then
@@ -1426,6 +1488,7 @@ function denoise(opts)
 
   local frames = frames_to_process(spr, { all_frames = opts.all_frames })
   local replaced = 0
+  local inside = selection_filter(spr)
 
   app.transaction(function()
     for _, frame in ipairs(frames) do
@@ -1437,6 +1500,10 @@ function denoise(opts)
         -- work on a clone; assigning it back to the cel at the end is what
         -- makes the whole operation a single undoable step
         local work = img:clone()
+        local ox, oy = cel.position.x, cel.position.y
+        local function writable(x, y)
+          return inside == nil or inside(ox + x, oy + y)
+        end
 
         local function getc(x, y)
           if x < 0 or x >= w or y < 0 or y >= h then return nil end
@@ -1505,8 +1572,10 @@ function denoise(opts)
             end
           end
           for _, ch in ipairs(changes) do
-            work:putPixel(ch.x, ch.y, ch.c)
-            applied = applied + 1
+            if writable(ch.x, ch.y) then
+              work:putPixel(ch.x, ch.y, ch.c)
+              applied = applied + 1
+            end
           end
           return applied
         end
@@ -1546,8 +1615,10 @@ function denoise(opts)
             end
           end
           for _, ch in ipairs(changes) do
-            work:putPixel(ch.x, ch.y, ch.c)
-            applied = applied + 1
+            if writable(ch.x, ch.y) then
+              work:putPixel(ch.x, ch.y, ch.c)
+              applied = applied + 1
+            end
           end
           return applied
         end
@@ -1832,7 +1903,7 @@ function denoise(opts)
                     local out = pc.rgba(pc.rgbaR(col), pc.rgbaG(col), pc.rgbaB(col), final_a)
                     -- only real changes count; writing the same colour again
                     -- would make the iteration never converge
-                    if out ~= own then
+                    if out ~= own and writable(jx, jy) then
                       work:putPixel(jx, jy, out)
                       applied = applied + 1
                     end
@@ -2087,7 +2158,13 @@ function init(plugin)
         frame = app.frame,
       }
       if not res then
-        app.alert(err == "pp_fail" and labels.pp_fail or labels.no_layer)
+        if err == "pp_no_sel" then
+          app.alert(labels.pp_no_sel)
+        elseif err == "pp_fail" then
+          app.alert(labels.pp_fail)
+        else
+          app.alert(labels.no_layer)
+        end
         return
       end
       if res.auto and (res.cell_w < 4 or res.cell_w > 20 or res.cell_h < 4 or res.cell_h > 20) then
