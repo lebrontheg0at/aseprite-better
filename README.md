@@ -86,8 +86,13 @@ noisy "fake pixel art" edges back into crisp pixel blocks.
 
 | Option | Meaning |
 |---|---|
-| Sampling | **Majority cluster** (two-means per cell — most robust), **Center sample**, or **Median** |
-| Grid size | **Auto detect**, or type the column/row count yourself |
+| Sampling | **Center sample** (default), **Majority cluster** (two-means per cell), or **Median** |
+| Grid size | **Manual** (default — type the column/row count), or **Auto detect** |
+
+**Manual grid size is honoured exactly:** the output sprite has exactly the
+columns/rows you typed (each cell keeps at least 1 px). Earlier builds derived
+the line count from a walking step, so a sub-2-px cell degenerated into one
+line per pixel and the result came out as the image size instead.
 | Merge similar colors | Tolerance for merging near-duplicate colours *after* sampling; `0` disables it |
 | Output | **New sprite** at the true pixel size, or **new layer** that keeps the canvas size |
 

@@ -696,21 +696,43 @@ local function snap_line(origin, range, profile, n)
 end
 
 -- Walk outward from the centre, snapping each successive grid line.
-local function refine_lines(size, profile, n, cell, intensity)
+-- Builds exactly count+1 grid lines across [0, size]. The old version walked
+-- outward from the centre adding `cell` each step, so the produced count
+-- depended on rounding: with sub-2px cells it degenerated to one line per
+-- pixel (a requested 345x240 came out as the image size). Here the count is
+-- fixed by construction: line 0 is 0, line count is size, interior lines sit
+-- at i*cell (snapped to a nearby gradient edge when the cell is wide enough
+-- to make that meaningful) and are kept strictly increasing, so the sampled
+-- grid always has exactly `count` cells.
+local function build_lines(size, profile, n, count, intensity)
   local coords = {}
-  local x = snap_line(size / 2, cell, profile, n)
-  while x < n + cell / 2 do
-    x = snap_line(x, cell * intensity, profile, n)
-    coords[#coords + 1] = x
-    x = x + cell
+  if count <= 0 then return coords end
+  local cell = size / count
+  local snap_range = cell * intensity
+  for i = 0, count do
+    local line
+    if i == 0 then
+      line = 0
+    elseif i == count then
+      line = size
+    else
+      local origin = i * cell
+      -- sub-3px cells have no meaningful edge to snap to
+      if cell >= 3 and snap_range >= 1 then
+        line = snap_line(origin, snap_range, profile, n)
+      else
+        line = math.floor(origin + 0.5)
+      end
+    end
+    -- keep room for the remaining lines and for the final one at `size`
+    local remaining = count - i
+    if line > size - remaining then line = size - remaining end
+    if line < 1 then line = 1 end
+    if #coords > 0 and line <= coords[#coords] then
+      line = coords[#coords] + 1
+    end
+    coords[#coords + 1] = line
   end
-  x = snap_line(size / 2, cell, profile, n) - cell
-  while x > -cell / 2 do
-    x = snap_line(x, cell * intensity, profile, n)
-    coords[#coords + 1] = x
-    x = x - cell
-  end
-  table.sort(coords)
   return coords
 end
 
@@ -945,14 +967,15 @@ function perfect_pixel_restore(opts)
     local cw, ch = w / gw, h / gh
     if cw < 2 or cw > 64 or ch < 2 or ch > 64 then return nil, "pp_fail" end
   else
+    -- manual: at most one cell per pixel, so every cell keeps at least 1 px
     gw = math.max(1, math.min(w, gw))
     gh = math.max(1, math.min(h, gh))
   end
 
   local cell_w = w / gw
   local cell_h = h / gh
-  local xs = refine_lines(w, col_sum, w, cell_w, 0.25)
-  local ys = refine_lines(h, row_sum, h, cell_h, 0.25)
+  local xs = build_lines(w, col_sum, w, gw, 0.25)
+  local ys = build_lines(h, row_sum, h, gh, 0.25)
   if #xs < 2 or #ys < 2 then return nil, "pp_fail" end
 
   local nw, nh = #xs - 1, #ys - 1
@@ -2277,12 +2300,12 @@ function init(plugin)
       dlg:separator{}
       dlg:combobox{
         id = "sampling", label = labels.pp_sampling,
-        option = labels.pp_s_majority,
+        option = labels.pp_s_center,
         options = { labels.pp_s_majority, labels.pp_s_center, labels.pp_s_median },
       }
       dlg:combobox{
         id = "grid", label = labels.pp_grid,
-        option = labels.pp_g_auto,
+        option = labels.pp_g_manual,
         options = { labels.pp_g_auto, labels.pp_g_manual },
       }
       dlg:number{ id = "grid_w", label = labels.pp_grid_w, text = "32", decimals = 0 }
