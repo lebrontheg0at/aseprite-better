@@ -195,6 +195,30 @@ whole — not pixel by pixel:
   own alpha kept when the neighbourhood is unanimous, and left alone otherwise
   (soft shadows keep their alpha).
 
+### 7. Despeckle
+
+`Edit → FX → Despeckle` (`编辑 → FX → 降噪`).
+
+A deliberately simple, fully predictable denoise: one rule, one pass.
+
+**Rule:** a pixel is "single" when **all eight** of its neighbours (orthogonal
+and diagonal) are different from it. Such a pixel takes the neighbouring colour
+that occurs **most often**; when several colours share the highest count, the
+**darkest** one wins (ties in darkness go to the more opaque one, then to the
+smaller RGB sum, so the result is always deterministic).
+
+- a pixel with even one same-coloured neighbour is left alone;
+- pixels on the canvas border are skipped (incomplete neighbourhood);
+- the chosen colour is taken from the neighbours as-is — no averaging, no new
+  colours;
+- opacity never increases, transparent areas are never filled;
+- a selection clips the result, and the whole run is one undo step.
+
+| Option | Meaning |
+|---|---|
+| Colour similarity threshold | RGBA distance that still counts as "the same colour" (default 24; `0` = strictly identical) |
+| Scope | Current frame / all frames of the layer |
+
 ## License
 
 CC0 — Public Domain.

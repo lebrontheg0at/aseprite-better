@@ -96,6 +96,10 @@ local function ui_labels()
       de_maxw = "噪点最大宽度 (px)",
       de_tol = "颜色接近阈值",
       de_summary = "去噪完成：替换 %d 个像素。",
+      -- despeckle command
+      ds_title = "降噪",
+      ds_about = "把四周 8 个像素全都与它不同的孤立像素，换成周围出现最多的颜色（并列时取最深）。",
+      ds_summary = "降噪完成：替换 %d 个像素。",
     }
   end
   return {
@@ -170,6 +174,9 @@ local function ui_labels()
     de_maxw = "Max noise size (px)",
     de_tol = "Colour similarity threshold",
     de_summary = "Denoise done: %d pixel(s) replaced.",
+    ds_title = "Despeckle",
+    ds_about = "Replace isolated pixels - all eight neighbours differ - with the most frequent surrounding colour (darkest on a tie).",
+    ds_summary = "Despeckle done: %d pixel(s) replaced.",
   }
 end
 
@@ -1945,6 +1952,159 @@ function denoise(opts)
   return { replaced = replaced }
 end
 -- ---------------------------------------------------------------------------
+-- 7. Despeckle (single pixels)
+-- ---------------------------------------------------------------------------
+
+-- Replaces single pixels with their surrounding colour.
+--
+-- A pixel counts as "single" when ALL EIGHT of its neighbours (orthogonal and
+-- diagonal) are different from it. Such a pixel takes the neighbour colour
+-- that occurs most often; when two or more colours share that highest count,
+-- the DARKEST one wins (ties in darkness go to the more opaque one, then to
+-- the smaller RGB sum, so the result is deterministic).
+--
+-- Guarantees kept from the other pixel commands: only existing pixels are
+-- touched (transparent areas are never filled), a pixel's opacity never
+-- increases, a selection clips the result, and the whole run is one undo step.
+--
+-- opts fields:
+--   layer      Layer (defaults to the active layer)
+--   tolerance  number 0..255, RGBA distance that still counts as "the same colour"
+--   all_frames boolean
+-- Returns { replaced = n }.
+function despeckle(opts)
+  local spr = app.activeSprite
+  if not spr then return nil end
+  local layer = opts.layer or app.activeLayer
+  if not layer then return nil end
+
+  local tol = math.max(0, math.min(255, math.floor(opts.tolerance or 24)))
+  local tol2 = tol * tol
+  local frames = frames_to_process(spr, { all_frames = opts.all_frames })
+  local inside = selection_filter(spr)
+  local replaced = 0
+
+  -- ranking: most frequent, then darkest, then more opaque, then smaller RGB sum
+  local function better(a, b)
+    if a.count ~= b.count then return a.count > b.count end
+    local la = 0.299 * pc.rgbaR(a.col) + 0.587 * pc.rgbaG(a.col) + 0.114 * pc.rgbaB(a.col)
+    local lb = 0.299 * pc.rgbaR(b.col) + 0.587 * pc.rgbaG(b.col) + 0.114 * pc.rgbaB(b.col)
+    if la ~= lb then return la < lb end
+    local aa, ab = pc.rgbaA(a.col), pc.rgbaA(b.col)
+    if aa ~= ab then return aa > ab end
+    return (pc.rgbaR(a.col) + pc.rgbaG(a.col) + pc.rgbaB(a.col))
+      < (pc.rgbaR(b.col) + pc.rgbaG(b.col) + pc.rgbaB(b.col))
+  end
+
+  app.transaction(function()
+    for _, frame in ipairs(frames) do
+      local cel = layer:cel(frame)
+      if cel then
+        local img = cel.image
+        local w, h = img.width, img.height
+        -- clone + assign back at the end: one undo step
+        local work = img:clone()
+        local ox, oy = cel.position.x, cel.position.y
+        local changes = {}
+
+        for y = 0, h - 1 do
+          for x = 0, w - 1 do
+            local c = work:getPixel(x, y)
+            if pc.rgbaA(c) > 0 and (inside == nil or inside(ox + x, oy + y)) then
+              local nb = {}
+              local complete = true
+              for dy = -1, 1 do
+                for dx = -1, 1 do
+                  if dx ~= 0 or dy ~= 0 then
+                    local nx, ny = x + dx, y + dy
+                    if nx < 0 or nx >= w or ny < 0 or ny >= h then
+                      complete = false
+                      break
+                    end
+                    nb[#nb + 1] = work:getPixel(nx, ny)
+                  end
+                end
+                if not complete then break end
+              end
+
+              if complete then
+                -- "single" = every one of the eight neighbours differs from it
+                local all_different = true
+                for _, v in ipairs(nb) do
+                  if rgba_dist2(v, c) <= tol2 then
+                    all_different = false
+                    break
+                  end
+                end
+
+                if all_different then
+                  -- cluster the neighbours by tolerance and count them
+                  local cands = {}
+                  for _, v in ipairs(nb) do
+                    local found = nil
+                    for _, cd in ipairs(cands) do
+                      if rgba_dist2(v, cd.col) <= tol2 then
+                        found = cd
+                        break
+                      end
+                    end
+                    if found then
+                      found.count = found.count + 1
+                      found.votes[v] = (found.votes[v] or 0) + 1
+                    else
+                      local votes = {}
+                      votes[v] = 1
+                      cands[#cands + 1] = { col = v, count = 1, votes = votes }
+                    end
+                  end
+
+                  -- most frequent, darkest on a tie
+                  local best = cands[1]
+                  for i = 2, #cands do
+                    if better(cands[i], best) then best = cands[i] end
+                  end
+
+                  -- take the exact colour most represented inside that cluster
+                  local rep, best_v = nil, 0
+                  for v, n in pairs(best.votes) do
+                    if n > best_v then
+                      best_v = n
+                      rep = v
+                    end
+                  end
+
+                  if rep then
+                    local na = pc.rgbaA(c)
+                    local ra = pc.rgbaA(rep)
+                    local final_a = na
+                    if ra < na then final_a = ra end
+                    local out = pc.rgba(pc.rgbaR(rep), pc.rgbaG(rep), pc.rgbaB(rep), final_a)
+                    if out ~= c then
+                      changes[#changes + 1] = { x = x, y = y, c = out }
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+
+        for _, ch in ipairs(changes) do
+          work:putPixel(ch.x, ch.y, ch.c)
+          replaced = replaced + 1
+        end
+        if #changes > 0 then
+          cel.image = work
+        end
+      end
+    end
+  end)
+
+  app.refresh()
+  return { replaced = replaced }
+end
+
+-- ---------------------------------------------------------------------------
 -- Registration
 -- ---------------------------------------------------------------------------
 
@@ -2286,6 +2446,52 @@ function init(plugin)
       }
       if res then
         app.alert(string.format(labels.de_summary, res.replaced))
+      end
+    end,
+  }
+
+  plugin:newCommand{
+    id = "Despeckle",
+    title = labels.ds_title,
+    group = "edit_fx",
+    onclick = function()
+      local spr = app.activeSprite
+      if not spr then
+        app.alert(labels.no_sprite)
+        return
+      end
+      if not app.activeLayer then
+        app.alert(labels.no_layer)
+        return
+      end
+
+      local dlg = Dialog{ title = labels.ds_title }
+      if not dlg then return end
+
+      dlg:label{ label = labels.ds_about }
+      dlg:separator{}
+      dlg:number{ id = "tol", label = labels.de_tol, text = "24", decimals = 0 }
+      dlg:separator{}
+      dlg:combobox{
+        id = "scope", label = labels.scope,
+        option = labels.scope_cel,
+        options = { labels.scope_cel, labels.scope_frames },
+      }
+      dlg:separator{}
+      dlg:button{ id = "ok", text = "OK", focus = true }
+      dlg:button{ id = "cancel", text = "Cancel" }
+      dlg:show()
+
+      local data = dlg.data
+      if not data.ok then return end
+
+      local res = despeckle{
+        layer = app.activeLayer,
+        tolerance = data.tol,
+        all_frames = (data.scope == labels.scope_frames),
+      }
+      if res then
+        app.alert(string.format(labels.ds_summary, res.replaced))
       end
     end,
   }
